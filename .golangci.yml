@@ -1,0 +1,29 @@
+# Default set (errcheck, govet, ineffassign, staticcheck, unused) plus linters
+# measured at 0 findings on the local code. Skipped on purpose: gosec (G204
+# fires on every exec.Command, which is the design) and gocritic (style churn).
+#
+# The `internal/` tree is vendored from chojs23/ec (see NOTICE.md). Upstream
+# carries its own lint debt; only files authored or modified locally are linted.
+version: "2"
+linters:
+  enable:
+    - asasalint
+    - errorlint
+    - makezero
+    - misspell
+    - nakedret
+    - nolintlint
+    - predeclared
+    - unconvert
+  exclusions:
+    paths:
+      - internal/tui/tui.go
+      - internal/tui/diff.go
+      - internal/tui/diff_render.go
+      - internal/tui/render_helpers.go
+      - internal/tui/select_test.go
+      - internal/tui/tui_test.go
+      - internal/tui/workspace_test.go
+      - internal/run/run.go
+      - internal/run/select.go
+      - internal/run/select_test.go

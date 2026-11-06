@@ -1,0 +1,2257 @@
+package tui
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/sovengar/ec/internal/cli"
+	"github.com/sovengar/ec/internal/engine"
+	"github.com/sovengar/ec/internal/gitmerge"
+	"github.com/sovengar/ec/internal/markers"
+	"github.com/sovengar/ec/internal/mergeview"
+)
+
+func parseSingleConflictDoc(t *testing.T) markers.Document {
+	t.Helper()
+	data := []byte("start\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nend\n")
+	doc, err := markers.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	return doc
+}
+
+func conflictSegment(t *testing.T, doc markers.Document, index int) markers.ConflictSegment {
+	t.Helper()
+	ref := doc.Conflicts[index]
+	seg, ok := doc.Segments[ref.SegmentIndex].(markers.ConflictSegment)
+	if !ok {
+		t.Fatalf("expected conflict segment")
+	}
+	return seg
+}
+
+func TestModelQuitLeavesTheTUI(t *testing.T) {
+	m := model{}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updatedModel := updated.(model)
+	if updatedModel.err != nil {
+		t.Fatalf("q must not return to the selector, got %v", updatedModel.err)
+	}
+	if !updatedModel.quitting || !updatedModel.quitAll {
+		t.Fatalf("q must quit the TUI")
+	}
+}
+
+func TestModelEscBackToSelector(t *testing.T) {
+	m := model{}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updatedModel := updated.(model)
+	if updatedModel.err != ErrBackToSelector {
+		t.Fatalf("expected ErrBackToSelector, got %v", updatedModel.err)
+	}
+	if !updatedModel.quitting {
+		t.Fatalf("expected quitting true")
+	}
+}
+
+func TestModelWriteDoesNotQuit(t *testing.T) {
+	file, err := os.CreateTemp("", "ec-merged-*")
+	if err != nil {
+		t.Fatalf("CreateTemp error = %v", err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+	defer os.Remove(path)
+
+	if err := os.WriteFile(path, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	doc := markers.Document{Segments: []markers.Segment{markers.TextSegment{Bytes: []byte("resolved\n")}}}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		state: state,
+		doc:   doc,
+		opts:  cliOptionsWithMergedPath(path),
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	updatedModel := updated.(model)
+	if updatedModel.err != nil {
+		t.Fatalf("expected no error, got %v", updatedModel.err)
+	}
+	if updatedModel.quitting {
+		t.Fatalf("expected quitting false")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(data) != "resolved\n" {
+		t.Fatalf("merged content = %q, want %q", string(data), "resolved\n")
+	}
+}
+
+func TestOpenEditorWithUnresolvedConflicts(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	mergedContent := []byte("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n")
+	if err := os.WriteFile(mergedPath, mergedContent, 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	data, err := os.ReadFile(mergedPath)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+
+	doc, err := markers.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	if err := state.ImportMerged([]byte("line1\nmanual\nline2\n")); err != nil {
+		t.Fatalf("ImportMerged error = %v", err)
+	}
+
+	editorPath := filepath.Join(tmpDir, "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile editor error = %v", err)
+	}
+
+	originalEditor := os.Getenv("EDITOR")
+	if err := os.Setenv("EDITOR", editorPath); err != nil {
+		t.Fatalf("Setenv error = %v", err)
+	}
+	defer os.Setenv("EDITOR", originalEditor)
+
+	m := model{
+		state: state,
+		opts:  cliOptionsWithMergedPath(mergedPath),
+	}
+
+	cmd := m.openEditor()
+	msg := cmd()
+	typeName := fmt.Sprintf("%T", msg)
+	if !strings.Contains(typeName, "execMsg") {
+		t.Fatalf("unexpected msg type %T", msg)
+	}
+}
+
+func TestOpenEditorUsesManualResolvedPreview(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	conflicted := []byte("line1\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\nline2\n")
+	if err := os.WriteFile(mergedPath, conflicted, 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	doc, err := markers.Parse(conflicted)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	if err := state.ImportMerged([]byte("line1\nmanual\nline2\n")); err != nil {
+		t.Fatalf("ImportMerged error = %v", err)
+	}
+
+	editorPath := filepath.Join(tmpDir, "editor.sh")
+	if err := os.WriteFile(editorPath, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile editor error = %v", err)
+	}
+
+	originalEditor := os.Getenv("EDITOR")
+	if err := os.Setenv("EDITOR", editorPath); err != nil {
+		t.Fatalf("Setenv error = %v", err)
+	}
+	defer os.Setenv("EDITOR", originalEditor)
+
+	m := model{
+		state: state,
+		opts:  cliOptionsWithMergedPath(mergedPath),
+	}
+	m.refreshResolverCaches()
+
+	msg := m.openEditor()()
+	if !strings.Contains(fmt.Sprintf("%T", msg), "execMsg") {
+		t.Fatalf("unexpected msg type %T", msg)
+	}
+
+	data, err := os.ReadFile(mergedPath)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(data) != "line1\nmanual\nline2\n" {
+		t.Fatalf("merged content = %q, want %q", string(data), "line1\\nmanual\\nline2\\n")
+	}
+}
+
+func TestReloadFromFilePreservesManualResolution(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "line1\nbase\nline3\n"
+	localContent := "line1\nlocal\nline3\n"
+	remoteContent := "line1\nremote\nline3\n"
+	mergedContent := "line1\nmanual\nline3\n"
+
+	if err := os.WriteFile(basePath, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(localContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte(remoteContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	}
+
+	diff3Bytes, err := gitmerge.MergeFileDiff3(ctx, opts.LocalPath, opts.BasePath, opts.RemotePath)
+	if err != nil {
+		t.Fatalf("MergeFileDiff3 failed: %v", err)
+	}
+
+	doc, err := markers.Parse(diff3Bytes)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		ctx:   ctx,
+		opts:  opts,
+		state: state,
+		doc:   doc,
+	}
+
+	if err := m.reloadFromFile(); err != nil {
+		t.Fatalf("reloadFromFile error = %v", err)
+	}
+
+	manual, ok := m.manualResolved[0]
+	if !ok {
+		t.Fatalf("expected manual resolution for conflict 0")
+	}
+	if string(manual) != "manual\n" {
+		t.Fatalf("manual resolution = %q", string(manual))
+	}
+
+	updatedModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = updatedModel.(model)
+	if _, ok := m.manualResolved[0]; ok {
+		t.Fatalf("manual resolution should be removed after undo")
+	}
+
+	updatedModel, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	m = updatedModel.(model)
+	manual, ok = m.manualResolved[0]
+	if !ok {
+		t.Fatalf("expected manual resolution for conflict 0 after redo")
+	}
+	if string(manual) != "manual\n" {
+		t.Fatalf("manual resolution after redo = %q", string(manual))
+	}
+}
+
+func TestLoadResolverDocumentStateKeepsCanonicalConflictStructureWithMergedMarkers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "intro\nbase line\noutro\n"
+	localContent := "intro\nlocal line\noutro\n"
+	remoteContent := "intro\nremote line\noutro\n"
+	mergedContent := "intro edited\n<<<<<<< ours-label\nlocal from merged\n=======\nremote from merged\n>>>>>>> theirs-label\noutro edited\n"
+
+	if err := os.WriteFile(basePath, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(localContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte(remoteContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := loadResolverDocumentState(ctx, cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	})
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if len(state.manualResolved) != 0 {
+		t.Fatalf("manualResolved = %d, want 0", len(state.manualResolved))
+	}
+	if len(state.doc.Conflicts) != 1 {
+		t.Fatalf("conflicts = %d, want 1", len(state.doc.Conflicts))
+	}
+
+	intro, ok := state.doc.Segments[0].(markers.TextSegment)
+	if !ok {
+		t.Fatalf("segment 0 = %T, want TextSegment", state.doc.Segments[0])
+	}
+	if string(intro.Bytes) != "intro edited\n" {
+		t.Fatalf("intro text = %q", string(intro.Bytes))
+	}
+
+	seg := conflictSegment(t, state.doc, 0)
+	if string(seg.Ours) != "local line\n" {
+		t.Fatalf("seg.Ours = %q", string(seg.Ours))
+	}
+	if string(seg.Base) != "base line\n" {
+		t.Fatalf("seg.Base = %q", string(seg.Base))
+	}
+	if string(seg.Theirs) != "remote line\n" {
+		t.Fatalf("seg.Theirs = %q", string(seg.Theirs))
+	}
+	if !state.mergedLabelKnown[0] {
+		t.Fatalf("mergedLabelKnown[0] = false, want true")
+	}
+	if state.mergedLabels[0].OursLabel != "ours-label" || state.mergedLabels[0].TheirsLabel != "theirs-label" {
+		t.Fatalf("mergedLabels[0] = %+v", state.mergedLabels[0])
+	}
+
+	outro, ok := state.doc.Segments[2].(markers.TextSegment)
+	if !ok {
+		t.Fatalf("segment 2 = %T, want TextSegment", state.doc.Segments[2])
+	}
+	if string(outro.Bytes) != "outro edited\n" {
+		t.Fatalf("outro text = %q", string(outro.Bytes))
+	}
+}
+
+func TestLoadResolverDocumentStateSkipsEmptyMergedFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "left.txt")
+	remotePath := filepath.Join(tmpDir, "right.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	for path, content := range map[string][]byte{
+		basePath:   []byte("line1\nline2\n"),
+		localPath:  []byte("line1\nline2\nleft line\n"),
+		remotePath: []byte("line1\nline2\nright line\n"),
+		mergedPath: nil,
+	} {
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatalf("WriteFile %s error = %v", filepath.Base(path), err)
+		}
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	}
+
+	resolverState, err := loadResolverDocumentState(ctx, opts)
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if len(resolverState.doc.Conflicts) != 1 {
+		t.Fatalf("conflicts = %d, want 1", len(resolverState.doc.Conflicts))
+	}
+
+	got := string(resolverState.state.RenderMerged())
+	if !strings.Contains(got, "line1\nline2\n") {
+		t.Fatalf("RenderMerged missing canonical context:\n%s", got)
+	}
+	if !strings.Contains(got, "<<<<<<<") {
+		t.Fatalf("RenderMerged should still contain unresolved markers:\n%s", got)
+	}
+}
+
+func TestBothKeepsContextWithEmptyMergedFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "left.txt")
+	remotePath := filepath.Join(tmpDir, "right.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	for path, content := range map[string][]byte{
+		basePath:   []byte("line1\nline2\n"),
+		localPath:  []byte("line1\nline2\nleft line\n"),
+		remotePath: []byte("line1\nline2\nright line\n"),
+		mergedPath: nil,
+	} {
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatalf("WriteFile %s error = %v", filepath.Base(path), err)
+		}
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	}
+
+	resolverState, err := loadResolverDocumentState(ctx, opts)
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if err := resolverState.state.ApplyResolution(0, markers.ResolutionBoth); err != nil {
+		t.Fatalf("ApplyResolution error = %v", err)
+	}
+
+	got := string(resolverState.state.RenderMerged())
+	want := "line1\nline2\nleft line\nright line\n"
+	if got != want {
+		t.Fatalf("RenderMerged = %q, want %q", got, want)
+	}
+}
+
+func TestLoadResolverDocumentStateKeepsEmptyResolvedConflict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "left.txt")
+	remotePath := filepath.Join(tmpDir, "right.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	for path, content := range map[string][]byte{
+		basePath:   nil,
+		localPath:  []byte("left line\n"),
+		remotePath: []byte("right line\n"),
+		mergedPath: nil,
+	} {
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatalf("WriteFile %s error = %v", filepath.Base(path), err)
+		}
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	}
+
+	resolverState, err := loadResolverDocumentState(ctx, opts)
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if resolverState.state.HasUnresolvedConflicts() {
+		t.Fatal("expected empty merged file to remain a valid empty resolution")
+	}
+	if got := string(resolverState.state.RenderMerged()); got != "" {
+		t.Fatalf("RenderMerged = %q, want empty string", got)
+	}
+}
+
+func TestLoadResolverDocumentStateFallsBackForMixedResolvedMergedFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "top\nbase1\nmiddle\nbase2\nbottom\n"
+	localContent := "top\nlocal1\nmiddle\nlocal2\nbottom\n"
+	remoteContent := "top\nremote1\nmiddle\nremote2\nbottom\n"
+	mergedContent := "top\nlocal1\nmiddle\n<<<<<<< ours\nlocal2\n=======\nremote2\n>>>>>>> theirs\nbottom\n"
+
+	if err := os.WriteFile(basePath, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(localContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte(remoteContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := loadResolverDocumentState(ctx, cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	})
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if len(state.doc.Conflicts) != 2 {
+		t.Fatalf("conflicts = %d, want 2", len(state.doc.Conflicts))
+	}
+	first := conflictSegment(t, state.doc, 0)
+	if first.Resolution != markers.ResolutionOurs {
+		t.Fatalf("first resolution = %q, want %q", first.Resolution, markers.ResolutionOurs)
+	}
+	middleText, ok := state.doc.Segments[2].(markers.TextSegment)
+	if !ok {
+		t.Fatalf("segment 2 = %T, want TextSegment", state.doc.Segments[2])
+	}
+	if string(middleText.Bytes) != "middle\n" {
+		t.Fatalf("middle text = %q", string(middleText.Bytes))
+	}
+	second := conflictSegment(t, state.doc, 1)
+	if second.Resolution != markers.ResolutionUnset {
+		t.Fatalf("second resolution = %q, want unset", second.Resolution)
+	}
+
+}
+
+func TestInitialLoadRenderUsesModelOwnedMergeState(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "start\nbase\nend\n"
+	localContent := "start\nours\nend\n"
+	remoteContent := "start\ntheirs\nend\n"
+	mergedContent := "start\nmanual\nend\n"
+
+	for path, content := range map[string]string{
+		basePath:   baseContent,
+		localPath:  localContent,
+		remotePath: remoteContent,
+		mergedPath: mergedContent,
+	} {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	resolverState, err := loadResolverDocumentState(ctx, cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	})
+	if err != nil {
+		t.Fatalf("loadResolverDocumentState error = %v", err)
+	}
+	if resolverState.state == nil {
+		t.Fatal("resolverState.state = nil")
+	}
+	if got := string(resolverState.state.RenderMerged()); got != mergedContent {
+		t.Fatalf("RenderMerged = %q, want %q", got, mergedContent)
+	}
+	manual, ok := resolverState.manualResolved[0]
+	if !ok {
+		t.Fatal("expected manual resolution for conflict 0")
+	}
+	if string(manual) != "manual\n" {
+		t.Fatalf("manual resolution = %q, want %q", string(manual), "manual\\n")
+	}
+
+	m := model{
+		ready:            true,
+		ctx:              ctx,
+		opts:             cli.Options{BasePath: basePath, LocalPath: localPath, RemotePath: remotePath, MergedPath: mergedPath},
+		state:            resolverState.state,
+		doc:              resolverState.doc,
+		manualResolved:   resolverState.manualResolved,
+		mergedLabels:     resolverState.mergedLabels,
+		mergedLabelKnown: resolverState.mergedLabelKnown,
+		currentConflict:  0,
+		selectedSide:     selectedOurs,
+		viewportOurs:     viewport.New(40, 5),
+		viewportResult:   viewport.New(40, 5),
+		viewportTheirs:   viewport.New(40, 5),
+		width:            100,
+		height:           20,
+	}
+	m.updateViewports()
+
+	if !strings.Contains(m.viewportResult.View(), "manual") {
+		t.Fatalf("expected rendered result pane to include manual text, got:\n%s", m.viewportResult.View())
+	}
+	if !strings.Contains(m.View(), "RESULT") {
+		t.Fatalf("expected overall view to include RESULT header, got:\n%s", m.View())
+	}
+}
+
+func TestReloadFromFileKeepsCanonicalConflictStructureWithMergedMarkers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "intro\nbase line\noutro\n"
+	localContent := "intro\nlocal line\noutro\n"
+	remoteContent := "intro\nremote line\noutro\n"
+	mergedContent := "intro edited\n<<<<<<< ours-label\nlocal from merged\n=======\nremote from merged\n>>>>>>> theirs-label\noutro edited\n"
+
+	if err := os.WriteFile(basePath, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(localContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte(remoteContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	canonicalDoc, err := mergeview.LoadCanonicalDocument(ctx, cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	})
+	if err != nil {
+		t.Fatalf("LoadCanonicalDocument error = %v", err)
+	}
+	resolverState, err := engine.NewState(canonicalDoc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		ctx:   ctx,
+		opts:  cli.Options{BasePath: basePath, LocalPath: localPath, RemotePath: remotePath, MergedPath: mergedPath},
+		state: resolverState,
+		doc:   canonicalDoc,
+	}
+
+	if err := m.reloadFromFile(); err != nil {
+		t.Fatalf("reloadFromFile error = %v", err)
+	}
+
+	intro, ok := m.doc.Segments[0].(markers.TextSegment)
+	if !ok {
+		t.Fatalf("segment 0 = %T, want TextSegment", m.doc.Segments[0])
+	}
+	if string(intro.Bytes) != "intro edited\n" {
+		t.Fatalf("intro text = %q", string(intro.Bytes))
+	}
+
+	seg := conflictSegment(t, m.doc, 0)
+	if string(seg.Ours) != "local line\n" {
+		t.Fatalf("seg.Ours = %q", string(seg.Ours))
+	}
+	if string(seg.Theirs) != "remote line\n" {
+		t.Fatalf("seg.Theirs = %q", string(seg.Theirs))
+	}
+	if !m.mergedLabelKnown[0] {
+		t.Fatalf("mergedLabelKnown[0] = false, want true")
+	}
+	if m.mergedLabels[0].OursLabel != "ours-label" || m.mergedLabels[0].TheirsLabel != "theirs-label" {
+		t.Fatalf("mergedLabels[0] = %+v", m.mergedLabels[0])
+	}
+	if len(m.manualResolved) != 0 {
+		t.Fatalf("manualResolved = %d, want 0", len(m.manualResolved))
+	}
+}
+
+func TestReloadFromFileKeepsExistingUndoHistory(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	baseContent := "line1\nbase\nline3\n"
+	localContent := "line1\nlocal\nline3\n"
+	remoteContent := "line1\nremote\nline3\n"
+	mergedContent := "line1\nlocal\nline3\n"
+
+	if err := os.WriteFile(basePath, []byte(baseContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte(localContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte(remoteContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  localPath,
+		RemotePath: remotePath,
+		MergedPath: mergedPath,
+	}
+
+	diff3Bytes, err := gitmerge.MergeFileDiff3(ctx, opts.LocalPath, opts.BasePath, opts.RemotePath)
+	if err != nil {
+		t.Fatalf("MergeFileDiff3 failed: %v", err)
+	}
+
+	doc, err := markers.Parse(diff3Bytes)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		ctx:   ctx,
+		opts:  opts,
+		state: state,
+		doc:   doc,
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = updated.(model)
+
+	if got := m.undoDepth(); got != 1 {
+		t.Fatalf("undo depth before manual reload = %d, want 1", got)
+	}
+	if got := m.redoDepth(); got != 1 {
+		t.Fatalf("redo depth before manual reload = %d, want 1", got)
+	}
+
+	if err := os.WriteFile(mergedPath, []byte("line1\nmanual\nline3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.reloadFromFile(); err != nil {
+		t.Fatalf("reloadFromFile error = %v", err)
+	}
+
+	if got := m.undoDepth(); got != 2 {
+		t.Fatalf("undo depth after manual reload = %d, want 2", got)
+	}
+	if got := m.redoDepth(); got != 0 {
+		t.Fatalf("redo depth after manual reload = %d, want 0", got)
+	}
+}
+
+func TestReloadFromFileAllowsTwoWayMergedConflictWhenCanonicalBaseLabelExists(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+
+	if err := os.WriteFile(basePath, []byte("intro\noutro\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte("intro\nours line\noutro\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remotePath, []byte("intro\ntheirs line\noutro\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mergedContent := "intro\n<<<<<<< ours-label\nours line\n=======\ntheirs line\n>>>>>>> theirs-label\noutro\n"
+	if err := os.WriteFile(mergedPath, []byte(mergedContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	diff3Bytes, err := gitmerge.MergeFileDiff3(ctx, localPath, basePath, remotePath)
+	if err != nil {
+		t.Fatalf("MergeFileDiff3 failed: %v", err)
+	}
+	doc, err := markers.Parse(diff3Bytes)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		ctx:   ctx,
+		opts:  cli.Options{BasePath: basePath, LocalPath: localPath, RemotePath: remotePath, MergedPath: mergedPath},
+		state: state,
+		doc:   doc,
+	}
+
+	if err := m.reloadFromFile(); err != nil {
+		t.Fatalf("reloadFromFile error = %v", err)
+	}
+	seg := conflictSegment(t, m.doc, 0)
+	if len(seg.Base) != 0 {
+		t.Fatalf("seg.Base = %q, want empty", string(seg.Base))
+	}
+	if seg.BaseLabel == "" {
+		t.Fatal("seg.BaseLabel = empty, want preserved canonical base label")
+	}
+	if !m.mergedLabelKnown[0] {
+		t.Fatalf("mergedLabelKnown[0] = false, want true")
+	}
+	if m.mergedLabels[0].OursLabel != "ours-label" || m.mergedLabels[0].TheirsLabel != "theirs-label" {
+		t.Fatalf("mergedLabels[0] = %+v", m.mergedLabels[0])
+	}
+}
+
+func TestModelInitReturnsNil(t *testing.T) {
+	if cmd := (model{}).Init(); cmd != nil {
+		t.Fatalf("Init() = %v, want nil", cmd)
+	}
+}
+
+func TestRunReturnsThemeLoadError(t *testing.T) {
+	resetThemeForTest()
+	t.Cleanup(resetThemeForTest)
+
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+
+	configPath := filepath.Join(configDir, "ec", themeConfigFileName)
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v", err)
+	}
+	if err := os.WriteFile(configPath, []byte("{bad"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	if err := Run(context.Background(), cli.Options{}); err == nil {
+		t.Fatal("Run() error = nil, want error")
+	}
+}
+
+func TestFormatLabel(t *testing.T) {
+	testCases := []struct {
+		name  string
+		label string
+		want  string
+	}{
+		{name: "empty", label: "", want: ""},
+		{name: "branch name", label: "main", want: "main"},
+		{name: "HEAD", label: "HEAD", want: "HEAD"},
+		{name: "feature branch", label: "feature/add-auth", want: "feature/add-auth"},
+		{name: "short hash exactly 7", label: "abc1234", want: "abc1234"},
+		{name: "long hash truncated", label: "abc1234def5678", want: "abc1234"},
+		{name: "full 40-char hash", label: "abc1234def5678901234567890abcdef12345678", want: "abc1234"},
+		{name: "hash with trailing text", label: "abc1234def5678 some info", want: "abc1234 some info"},
+		{name: "branch with short hex", label: "fix/deadbe", want: "fix/deadbe"},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatLabel(tc.label)
+			if got != tc.want {
+				t.Fatalf("formatLabel(%q) = %q, want %q", tc.label, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRenderPaneTitleFitsPaneWidth(t *testing.T) {
+	title := "OURS (/var/folders/n5/10r8gvt52mq58dpz62c7_jt00000gn/T/ec-local-766054358)"
+	paneWidth := 34
+
+	got := renderPaneTitle(title, paneWidth, titleStyle)
+	if lipgloss.Width(got) > paneWidth {
+		t.Fatalf("renderPaneTitle width = %d, want <= %d", lipgloss.Width(got), paneWidth)
+	}
+	if !strings.Contains(got, "...") {
+		t.Fatalf("expected truncated title with ellipsis, got %q", got)
+	}
+}
+
+func TestRenderPaneTitleHandlesVeryNarrowPane(t *testing.T) {
+	got := renderPaneTitle("OURS (HEAD)", 1, titleStyle)
+	if lipgloss.Width(got) > 1 {
+		t.Fatalf("renderPaneTitle width = %d, want <= 1", lipgloss.Width(got))
+	}
+}
+
+func TestSourcePaneTitlePrioritizesSelectionBeforeBranchLabel(t *testing.T) {
+	testCases := []struct {
+		name     string
+		side     string
+		selected bool
+		label    string
+		want     string
+	}{
+		{name: "selected with label", side: "OURS", selected: true, label: "HEAD", want: "OURS [selected] (HEAD)"},
+		{name: "not selected with label", side: "THEIRS", label: "feature", want: "THEIRS (feature)"},
+		{name: "selected without label", side: "OURS", selected: true, want: "OURS [selected]"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sourcePaneTitle(tc.side, tc.selected, tc.label); got != tc.want {
+				t.Fatalf("sourcePaneTitle() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	narrow := renderPaneTitle(sourcePaneTitle("OURS", true, "feature/very-long-branch"), 20, titleStyle)
+	if !strings.Contains(narrow, "OURS [selected]") || strings.Contains(narrow, "very-long-branch") {
+		t.Fatalf("narrow selected title should keep selection before optional label: %q", narrow)
+	}
+}
+
+func TestRenderResultPaneTitleFitsPaneWidth(t *testing.T) {
+	got := renderResultPaneTitle("Applied: manual", 18, resultTitleStyle, statusResolvedStyle)
+	if lipgloss.Width(got) > 18 {
+		t.Fatalf("renderResultPaneTitle width = %d, want <= 18", lipgloss.Width(got))
+	}
+	if !strings.Contains(got, "...") {
+		t.Fatalf("expected truncated title with ellipsis, got %q", got)
+	}
+}
+
+func TestRenderResultPaneTitleKeepsStatusWhenWide(t *testing.T) {
+	got := renderResultPaneTitle("Preview: OURS, not applied", 50, resultTitleStyle, statusUnresolvedStyle)
+	if !strings.Contains(got, "RESULT  Preview: OURS, not applied") {
+		t.Fatalf("expected full result status title, got %q", got)
+	}
+}
+
+func TestFirstHexRun(t *testing.T) {
+	start, end := firstHexRun("x1234567y")
+	if start != 1 || end != 8 {
+		t.Fatalf("firstHexRun = (%d, %d), want (1, 8)", start, end)
+	}
+
+	start, end = firstHexRun("nohex")
+	if start != -1 || end != -1 {
+		t.Fatalf("firstHexRun = (%d, %d), want (-1, -1)", start, end)
+	}
+
+	start, end = firstHexRun("x1234y")
+	if start != -1 || end != -1 {
+		t.Fatalf("firstHexRun = (%d, %d), want (-1, -1)", start, end)
+	}
+}
+
+func TestHexHelpers(t *testing.T) {
+	if !isHexRune('F') {
+		t.Fatalf("isHexRune('F') = false, want true")
+	}
+	if isHexRune('g') {
+		t.Fatalf("isHexRune('g') = true, want false")
+	}
+	if !isHexByte('a') {
+		t.Fatalf("isHexByte('a') = false, want true")
+	}
+	if isHexByte('G') {
+		t.Fatalf("isHexByte('G') = true, want false")
+	}
+}
+
+func cliOptionsWithMergedPath(path string) cli.Options {
+	return cli.Options{MergedPath: path}
+}
+
+func TestModelViewNotReady(t *testing.T) {
+	m := model{}
+	if !strings.Contains(m.View(), "Initializing") {
+		t.Fatalf("expected initializing view")
+	}
+}
+
+func TestModelViewQuittingStates(t *testing.T) {
+	testCases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "back", err: ErrBackToSelector, want: "Returning to selector"},
+		{name: "error", err: fmt.Errorf("boom"), want: "Error:"},
+		{name: "resolved", err: nil, want: "Resolved! File written."},
+	}
+
+	for _, tc := range testCases {
+		m := model{ready: true, quitting: true, err: tc.err}
+		if !strings.Contains(m.View(), tc.want) {
+			t.Fatalf("%s: expected %q in view", tc.name, tc.want)
+		}
+	}
+}
+
+func TestModelViewNoConflicts(t *testing.T) {
+	doc := markers.Document{Segments: []markers.Segment{markers.TextSegment{Bytes: []byte("hello\n")}}}
+	m := model{ready: true, doc: doc, opts: cliOptionsWithMergedPath("merged.txt")}
+	if !strings.Contains(m.View(), "No conflicts found") {
+		t.Fatalf("expected no conflicts view")
+	}
+}
+
+func TestModelViewReady(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	m := model{
+		ready:           true,
+		opts:            cliOptionsWithMergedPath("merged.txt"),
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		manualResolved:  map[int][]byte{},
+		viewportOurs:    viewport.New(40, 5),
+		viewportResult:  viewport.New(40, 5),
+		viewportTheirs:  viewport.New(40, 5),
+		width:           200,
+		height:          20,
+	}
+	m.viewportOurs.Width = 62
+	m.viewportResult.Width = 62
+	m.viewportTheirs.Width = 62
+	m.updateViewports()
+
+	view := m.View()
+	if !strings.Contains(view, "Conflict 1 of 1") || !strings.Contains(view, "1 remaining") {
+		t.Fatalf("expected conflict status in view")
+	}
+	if !strings.Contains(view, "RESULT") {
+		t.Fatalf("expected RESULT header in view")
+	}
+}
+
+func TestWindowSizeUsesAvailableHeight(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	m := model{
+		opts:            cliOptionsWithMergedPath("merged.txt"),
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		manualResolved:  map[int][]byte{},
+	}
+
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	resized := updated.(model)
+	if got := lipgloss.Height(resized.View()); got != 40 {
+		t.Fatalf("View height = %d, want 40", got)
+	}
+}
+
+func TestModelViewShowsBranchLabels(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	m := model{
+		ready:           true,
+		opts:            cliOptionsWithMergedPath("merged.txt"),
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		mergedLabels: []conflictLabels{
+			{OursLabel: "HEAD", TheirsLabel: "feature/add-auth"},
+		},
+		manualResolved: map[int][]byte{},
+		viewportOurs:   viewport.New(40, 5),
+		viewportResult: viewport.New(40, 5),
+		viewportTheirs: viewport.New(40, 5),
+		width:          120,
+		height:         20,
+	}
+	m.updateViewports()
+
+	view := m.View()
+	if !strings.Contains(view, "OURS [selected] (HEAD)") {
+		t.Fatalf("expected selected OURS label in view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "THEIRS (feature/add-auth)") {
+		t.Fatalf("expected THEIRS (feature/add-auth) in view, got:\n%s", view)
+	}
+}
+
+func TestModelViewTruncatesLongBranchLabels(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	longLabel := "/var/folders/n5/10r8gvt52mq58dpz62c7_jt00000gn/T/ec-local-766054358"
+	m := model{
+		ready:           true,
+		opts:            cliOptionsWithMergedPath("merged.txt"),
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		mergedLabels: []conflictLabels{
+			{OursLabel: longLabel, TheirsLabel: longLabel},
+		},
+		manualResolved: map[int][]byte{},
+		viewportOurs:   viewport.New(10, 5),
+		viewportResult: viewport.New(10, 5),
+		viewportTheirs: viewport.New(10, 5),
+		width:          90,
+		height:         20,
+	}
+	m.updateViewports()
+
+	view := m.View()
+	if strings.Contains(view, longLabel) {
+		t.Fatalf("expected long labels to be truncated, got:\n%s", view)
+	}
+	if !strings.Contains(view, "...") {
+		t.Fatalf("expected truncated labels with ellipsis, got:\n%s", view)
+	}
+}
+
+func TestModelViewNoLabelsWithoutMergedLabels(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	m := model{
+		ready:           true,
+		opts:            cliOptionsWithMergedPath("merged.txt"),
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		manualResolved:  map[int][]byte{},
+		viewportOurs:    viewport.New(10, 5),
+		viewportResult:  viewport.New(10, 5),
+		viewportTheirs:  viewport.New(10, 5),
+		width:           120,
+		height:          20,
+	}
+	m.updateViewports()
+
+	view := m.View()
+	if strings.Contains(view, "OURS (") {
+		t.Fatalf("expected plain OURS without label when mergedLabels is nil, got:\n%s", view)
+	}
+	if strings.Contains(view, "THEIRS (") {
+		t.Fatalf("expected plain THEIRS without label when mergedLabels is nil, got:\n%s", view)
+	}
+}
+
+func TestRenderToastLine(t *testing.T) {
+	m := model{width: 20, toastMessage: "Saved"}
+	if !strings.Contains(m.renderToastLine(), "Saved") {
+		t.Fatalf("expected toast line to include message")
+	}
+	m.toastMessage = strings.Repeat("A long workspace warning ", 10)
+	for _, width := range []int{20, 40, 80} {
+		m.width = width
+		if got := lipgloss.Height(m.renderToastLine()); got != 1 {
+			t.Fatalf("toast height at width %d = %d, want one reserved line", width, got)
+		}
+	}
+
+	m.toastMessage = ""
+	if strings.Contains(m.renderToastLine(), "Saved") {
+		t.Fatalf("did not expect toast message when empty")
+	}
+}
+
+func TestUpdateNavigationKeys(t *testing.T) {
+	doc := parseMultiConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.pendingScroll = false
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	next := updated.(model)
+	if next.currentConflict != 1 {
+		t.Fatalf("currentConflict = %d, want 1", next.currentConflict)
+	}
+	if next.pendingScroll {
+		t.Fatalf("expected pendingScroll false after updateViewports")
+	}
+
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	prev := updated.(model)
+	if prev.currentConflict != 0 {
+		t.Fatalf("currentConflict = %d, want 0", prev.currentConflict)
+	}
+}
+
+func TestUpdateApplyAndUndo(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.manualResolved = map[int][]byte{0: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	applied := updated.(model)
+	if len(applied.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(applied.manualResolved))
+	}
+	if got := conflictResolution(t, applied.doc, 0); got != markers.ResolutionOurs {
+		t.Fatalf("resolution = %q, want ours", got)
+	}
+
+	updated, _ = applied.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	undone := updated.(model)
+	if got := conflictResolution(t, undone.doc, 0); got != markers.ResolutionUnset {
+		t.Fatalf("resolution = %q, want unset", got)
+	}
+
+	updated, _ = undone.Update(tea.KeyMsg{Type: tea.KeyCtrlR})
+	redone := updated.(model)
+	if got := conflictResolution(t, redone.doc, 0); got != markers.ResolutionOurs {
+		t.Fatalf("resolution = %q, want ours after redo", got)
+	}
+}
+
+func TestUpdateApplyUsesResolverUndo(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+	applied := updated.(model)
+	if got := applied.undoDepth(); got != 1 {
+		t.Fatalf("resolver UndoDepth = %d, want 1", got)
+	}
+
+	updated, _ = applied.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	undone := updated.(model)
+	if got := conflictResolution(t, undone.doc, 0); got != markers.ResolutionUnset {
+		t.Fatalf("resolution = %q, want unset after undo", got)
+	}
+}
+
+func TestUpdateApplyAllClearsManual(t *testing.T) {
+	doc := parseMultiConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.manualResolved = map[int][]byte{0: []byte("manual\n"), 1: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}})
+	applied := updated.(model)
+	if len(applied.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(applied.manualResolved))
+	}
+	for i := range applied.doc.Conflicts {
+		if got := conflictResolution(t, applied.doc, i); got != markers.ResolutionOurs {
+			t.Fatalf("conflict %d resolution = %q, want ours", i, got)
+		}
+	}
+}
+
+func TestUpdateAcceptSelection(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.selectedSide = selectedTheirs
+	m.manualResolved = map[int][]byte{0: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	result := updated.(model)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionTheirs {
+		t.Fatalf("resolution = %q, want theirs", got)
+	}
+	if len(result.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	}
+}
+
+func TestUpdateAcceptNoOpDoesNotGrowUndo(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	result := updated.(model)
+	if got := result.undoDepth(); got != 1 {
+		t.Fatalf("UndoDepth = %d, want 1", got)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	result = updated.(model)
+	if got := result.undoDepth(); got != 1 {
+		t.Fatalf("UndoDepth = %d, want 1 after repeated accept", got)
+	}
+}
+
+func TestUpdateAcceptSelectionWithSpace(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.selectedSide = selectedTheirs
+	m.manualResolved = map[int][]byte{0: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+	result := updated.(model)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionTheirs {
+		t.Fatalf("resolution = %q, want theirs", got)
+	}
+	if len(result.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	}
+}
+
+func TestUpdateApplyTheirs(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.manualResolved = map[int][]byte{0: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	result := updated.(model)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionTheirs {
+		t.Fatalf("resolution = %q, want theirs", got)
+	}
+	if len(result.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	}
+}
+
+func TestUpdateApplyTheirsAll(t *testing.T) {
+	doc := parseMultiConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.manualResolved = map[int][]byte{0: []byte("manual\n"), 1: []byte("manual\n")}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'T'}})
+	result := updated.(model)
+	for i := range result.doc.Conflicts {
+		if got := conflictResolution(t, result.doc, i); got != markers.ResolutionTheirs {
+			t.Fatalf("conflict %d resolution = %q, want theirs", i, got)
+		}
+	}
+	if len(result.manualResolved) != 0 {
+		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	}
+}
+
+func TestUpdateApplyBothAndNone(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	result := updated.(model)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionBoth {
+		t.Fatalf("resolution = %q, want both", got)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	result = updated.(model)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionNone {
+		t.Fatalf("resolution = %q, want none", got)
+	}
+}
+
+func TestUpdateScrollHorizontalKeys(t *testing.T) {
+	content := "0123456789"
+	m := model{
+		viewportOurs:   viewport.New(5, 1),
+		viewportResult: viewport.New(5, 1),
+		viewportTheirs: viewport.New(5, 1),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(content)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlRight})
+	result := updated.(model)
+	if got := result.viewportOurs.View(); got != "45678" {
+		t.Fatalf("View = %q, want 45678 after ctrl+right", got)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyCtrlLeft})
+	result = updated.(model)
+	if got := result.viewportOurs.View(); got != "01234" {
+		t.Fatalf("View = %q, want 01234 after ctrl+left", got)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRight})
+	result = updated.(model)
+	if result.selectedSide != selectedTheirs {
+		t.Fatalf("right arrow must select theirs")
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	result = updated.(model)
+	if result.selectedSide != selectedOurs {
+		t.Fatalf("left arrow must select ours")
+	}
+}
+
+func TestUpdateKeySeqScroll(t *testing.T) {
+	lines := strings.Join([]string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}, "\n")
+	m := model{
+		viewportOurs:   viewport.New(5, 3),
+		viewportResult: viewport.New(5, 3),
+		viewportTheirs: viewport.New(5, 3),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(lines)
+		viewportModel.ScrollDown(5)
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	result := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected tick cmd for key sequence")
+	}
+	if result.keySeq != "g" {
+		t.Fatalf("keySeq = %q, want g", result.keySeq)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	result = updated.(model)
+	if result.keySeq != "" {
+		t.Fatalf("keySeq = %q, want cleared", result.keySeq)
+	}
+	if result.viewportOurs.YOffset != 0 {
+		t.Fatalf("YOffset = %d, want 0 after gg", result.viewportOurs.YOffset)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+	result = updated.(model)
+	if result.viewportOurs.YOffset != 7 {
+		t.Fatalf("YOffset = %d, want 7 after G", result.viewportOurs.YOffset)
+	}
+}
+
+func TestUpdateKeySeqRecenterSelectedHunk(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+	m := newModelForDoc(t, doc)
+	m.viewportOurs.Height = 1
+	m.viewportResult.Height = 1
+	m.viewportTheirs.Height = 1
+	m.updateViewports()
+
+	m.viewportOurs.YOffset = 2
+	m.viewportResult.YOffset = 2
+	m.viewportTheirs.YOffset = 2
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	result := updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected tick cmd for key sequence")
+	}
+	if result.keySeq != "z" {
+		t.Fatalf("keySeq = %q, want z", result.keySeq)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	result = updated.(model)
+	if result.keySeq != "" {
+		t.Fatalf("keySeq = %q, want cleared", result.keySeq)
+	}
+	if result.pendingScroll {
+		t.Fatalf("pendingScroll = true, want false after recenter")
+	}
+
+	for _, viewportModel := range []*viewport.Model{&result.viewportOurs, &result.viewportResult, &result.viewportTheirs} {
+		if viewportModel.YOffset != 1 {
+			t.Fatalf("YOffset = %d, want 1 after zz", viewportModel.YOffset)
+		}
+	}
+}
+
+func TestUpdateIgnoresUnmappedViewportKeys(t *testing.T) {
+	lines := strings.Join([]string{"one", "two", "three", "four", "five", "six"}, "\n")
+	m := model{
+		viewportOurs:   viewport.New(5, 3),
+		viewportResult: viewport.New(5, 3),
+		viewportTheirs: viewport.New(5, 3),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(lines)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	result := updated.(model)
+
+	if result.viewportOurs.YOffset != 0 {
+		t.Fatalf("YOffset = %d, want 0 after unmapped key", result.viewportOurs.YOffset)
+	}
+	if result.viewportResult.YOffset != 0 {
+		t.Fatalf("result YOffset = %d, want 0 after unmapped key", result.viewportResult.YOffset)
+	}
+	if result.viewportTheirs.YOffset != 0 {
+		t.Fatalf("theirs YOffset = %d, want 0 after unmapped key", result.viewportTheirs.YOffset)
+	}
+}
+
+func TestUpdateVerticalScrollKeys(t *testing.T) {
+	lines := strings.Join([]string{"one", "two", "three", "four", "five", "six"}, "\n")
+	m := model{
+		viewportOurs:   viewport.New(5, 3),
+		viewportResult: viewport.New(5, 3),
+		viewportTheirs: viewport.New(5, 3),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(lines)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlJ})
+	result := updated.(model)
+	if result.viewportOurs.YOffset != 1 {
+		t.Fatalf("YOffset = %d, want 1 after ctrl+j", result.viewportOurs.YOffset)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyCtrlK})
+	result = updated.(model)
+	if result.viewportOurs.YOffset != 0 {
+		t.Fatalf("YOffset = %d, want 0 after ctrl+k", result.viewportOurs.YOffset)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyDown})
+	result = updated.(model)
+	if result.currentConflict != 0 {
+		t.Fatalf("currentConflict = %d, want 0 with a single hunk", result.currentConflict)
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyUp})
+	result = updated.(model)
+	if result.currentConflict != 0 {
+		t.Fatalf("currentConflict = %d, want 0 with a single hunk", result.currentConflict)
+	}
+}
+
+func TestUpdateHalfPageScrollKeys(t *testing.T) {
+	lines := strings.Join([]string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve"}, "\n")
+	m := model{
+		viewportOurs:   viewport.New(8, 6),
+		viewportResult: viewport.New(8, 6),
+		viewportTheirs: viewport.New(8, 6),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(lines)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	result := updated.(model)
+	for _, viewportModel := range []*viewport.Model{&result.viewportOurs, &result.viewportResult, &result.viewportTheirs} {
+		if viewportModel.YOffset != 3 {
+			t.Fatalf("YOffset = %d, want 3 after ctrl+d", viewportModel.YOffset)
+		}
+	}
+
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	result = updated.(model)
+	for _, viewportModel := range []*viewport.Model{&result.viewportOurs, &result.viewportResult, &result.viewportTheirs} {
+		if viewportModel.YOffset != 0 {
+			t.Fatalf("YOffset = %d, want 0 after ctrl+u", viewportModel.YOffset)
+		}
+	}
+}
+
+func TestUpdateWriteKey(t *testing.T) {
+	tmpDir := t.TempDir()
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	if err := os.WriteFile(mergedPath, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	doc := markers.Document{Segments: []markers.Segment{markers.TextSegment{Bytes: []byte("resolved\n")}}}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		state: state,
+		doc:   doc,
+		opts:  cliOptionsWithMergedPath(mergedPath),
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'w'}})
+	result := updated.(model)
+	if result.toastMessage != "Saved" {
+		t.Fatalf("toastMessage = %q, want Saved", result.toastMessage)
+	}
+	if cmd == nil {
+		t.Fatalf("expected toast cmd")
+	}
+
+	data, err := os.ReadFile(mergedPath)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if string(data) != "resolved\n" {
+		t.Fatalf("merged content = %q, want resolved\\n", string(data))
+	}
+}
+
+func TestUpdateEditorKey(t *testing.T) {
+	originalEditor := os.Getenv("EDITOR")
+	if err := os.Setenv("EDITOR", "true"); err != nil {
+		t.Fatalf("Setenv error = %v", err)
+	}
+	defer os.Setenv("EDITOR", originalEditor)
+
+	m := model{}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+	_ = updated.(model)
+	if cmd == nil {
+		t.Fatalf("expected editor cmd")
+	}
+	if _, ok := cmd().(editorFinishedMsg); !ok {
+		t.Fatalf("expected editorFinishedMsg")
+	}
+}
+
+func TestUpdateCtrlC(t *testing.T) {
+	m := model{}
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	result := updated.(model)
+	if !result.quitting {
+		t.Fatalf("expected quitting true")
+	}
+}
+
+func TestPrepareFullDiffGuards(t *testing.T) {
+	doc := parseSingleConflictDoc(t)
+
+	_, _, _, _, useFullDiff := prepareFullDiff(doc, cli.Options{AllowMissingBase: true})
+	if useFullDiff {
+		t.Fatalf("expected useFullDiff false when AllowMissingBase is set")
+	}
+
+	_, _, _, _, useFullDiff = prepareFullDiff(doc, cli.Options{})
+	if useFullDiff {
+		t.Fatalf("expected useFullDiff false when paths are missing")
+	}
+}
+
+func TestIsTrulyMissingBasePath(t *testing.T) {
+	if !isTrulyMissingBasePath(os.DevNull) {
+		t.Fatalf("expected os.DevNull to be treated as missing base")
+	}
+
+	emptyPath := filepath.Join(t.TempDir(), "empty-base.txt")
+	if err := os.WriteFile(emptyPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if !isTrulyMissingBasePath(emptyPath) {
+		t.Fatalf("expected empty base file to be treated as missing base")
+	}
+
+	nonEmptyPath := filepath.Join(t.TempDir(), "base.txt")
+	if err := os.WriteFile(nonEmptyPath, []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if isTrulyMissingBasePath(nonEmptyPath) {
+		t.Fatalf("expected non-empty base file not to be treated as missing base")
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "missing-base.txt")
+	if isTrulyMissingBasePath(missingPath) {
+		t.Fatalf("expected missing base path not to be treated as true missing-base case")
+	}
+}
+
+func TestShouldAllowMissingBaseFallback(t *testing.T) {
+	emptyPath := filepath.Join(t.TempDir(), "empty-base.txt")
+	if err := os.WriteFile(emptyPath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	errMissingBase := errors.New("conflict 0 is missing base chunk (base completeness requires exact base for all conflicts)")
+	if shouldAllowMissingBaseFallback(context.Background(), cli.Options{BasePath: emptyPath}, errMissingBase) {
+		t.Fatalf("expected missing-base fallback to require git index stage confirmation")
+	}
+
+	nonEmptyPath := filepath.Join(t.TempDir(), "base.txt")
+	if err := os.WriteFile(nonEmptyPath, []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if shouldAllowMissingBaseFallback(context.Background(), cli.Options{BasePath: nonEmptyPath}, errMissingBase) {
+		t.Fatalf("expected non-empty base file not to allow fallback")
+	}
+
+	errOther := errors.New("internal: conflict 0 is not a ConflictSegment")
+	if shouldAllowMissingBaseFallback(context.Background(), cli.Options{BasePath: emptyPath}, errOther) {
+		t.Fatalf("expected non missing-base validation error not to allow fallback")
+	}
+}
+
+func TestIsTrulyMissingBaseStage_AddAddConflict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	repoDir := t.TempDir()
+	runGitCmd(t, repoDir, "init")
+	runGitCmd(t, repoDir, "config", "user.name", "test")
+	runGitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	runGitCmd(t, repoDir, "checkout", "-b", "main")
+
+	baseFile := filepath.Join(repoDir, "README.md")
+	if err := os.WriteFile(baseFile, []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "add", "README.md")
+	runGitCmd(t, repoDir, "commit", "-m", "base")
+
+	runGitCmd(t, repoDir, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repoDir, "temp.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "add", "temp.txt")
+	runGitCmd(t, repoDir, "commit", "-m", "feature add")
+
+	runGitCmd(t, repoDir, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repoDir, "temp.txt"), []byte("ours\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "add", "temp.txt")
+	runGitCmd(t, repoDir, "commit", "-m", "main add")
+
+	mergeCmd := exec.Command("git", "merge", "feature")
+	mergeCmd.Dir = repoDir
+	if out, err := mergeCmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected merge conflict, got success: %s", string(out))
+	}
+
+	missing, determined := isTrulyMissingBaseStage(context.Background(), filepath.Join(repoDir, "temp.txt"))
+	if !determined {
+		t.Fatalf("expected stage check to be determined")
+	}
+	if !missing {
+		t.Fatalf("expected add/add conflict to have missing base stage")
+	}
+
+	emptyBasePath := filepath.Join(repoDir, "empty-base.txt")
+	if err := os.WriteFile(emptyBasePath, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	errMissingBase := errors.New("conflict 0 is missing base chunk (base completeness requires exact base for all conflicts)")
+	if !shouldAllowMissingBaseFallback(context.Background(), cli.Options{BasePath: emptyBasePath, MergedPath: filepath.Join(repoDir, "temp.txt")}, errMissingBase) {
+		t.Fatalf("expected confirmed missing base stage to allow fallback")
+	}
+}
+
+func TestIsTrulyMissingBaseStage_ModifyModifyConflict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration-style test in short mode")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	repoDir := t.TempDir()
+	runGitCmd(t, repoDir, "init")
+	runGitCmd(t, repoDir, "config", "user.name", "test")
+	runGitCmd(t, repoDir, "config", "user.email", "test@example.com")
+	runGitCmd(t, repoDir, "checkout", "-b", "main")
+
+	if err := os.WriteFile(filepath.Join(repoDir, "temp.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "add", "temp.txt")
+	runGitCmd(t, repoDir, "commit", "-m", "base")
+
+	runGitCmd(t, repoDir, "checkout", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repoDir, "temp.txt"), []byte("theirs\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "commit", "-am", "feature edit")
+
+	runGitCmd(t, repoDir, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(repoDir, "temp.txt"), []byte("ours\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	runGitCmd(t, repoDir, "commit", "-am", "main edit")
+
+	mergeCmd := exec.Command("git", "merge", "feature")
+	mergeCmd.Dir = repoDir
+	if out, err := mergeCmd.CombinedOutput(); err == nil {
+		t.Fatalf("expected merge conflict, got success: %s", string(out))
+	}
+
+	missing, determined := isTrulyMissingBaseStage(context.Background(), filepath.Join(repoDir, "temp.txt"))
+	if !determined {
+		t.Fatalf("expected stage check to be determined")
+	}
+	if missing {
+		t.Fatalf("expected modify/modify conflict to have base stage")
+	}
+}
+
+func runGitCmd(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+	return string(out)
+}
+
+func TestPrepareFullDiffLoadFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.txt")
+	if err := os.WriteFile(basePath, []byte("base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	opts := cli.Options{
+		BasePath:   basePath,
+		LocalPath:  filepath.Join(tmpDir, "missing-local.txt"),
+		RemotePath: filepath.Join(tmpDir, "missing-remote.txt"),
+	}
+	_, _, _, _, useFullDiff := prepareFullDiff(parseSingleConflictDoc(t), opts)
+	if useFullDiff {
+		t.Fatalf("expected useFullDiff false when loadLines fails")
+	}
+}
+
+func TestPrepareFullDiffRangeFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	basePath := filepath.Join(tmpDir, "base.txt")
+	localPath := filepath.Join(tmpDir, "local.txt")
+	remotePath := filepath.Join(tmpDir, "remote.txt")
+
+	if err := os.WriteFile(basePath, []byte("different\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if err := os.WriteFile(localPath, []byte("ours\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	if err := os.WriteFile(remotePath, []byte("theirs\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	opts := cli.Options{BasePath: basePath, LocalPath: localPath, RemotePath: remotePath}
+	_, _, _, _, useFullDiff := prepareFullDiff(parseSingleConflictDoc(t), opts)
+	if useFullDiff {
+		t.Fatalf("expected useFullDiff false when conflict ranges cannot be computed")
+	}
+}
+
+func parseMultiConflictDoc(t *testing.T) markers.Document {
+	t.Helper()
+	data := []byte("start\n<<<<<<< HEAD\nours1\n=======\ntheirs1\n>>>>>>> branch\nmid\n<<<<<<< HEAD\nours2\n=======\ntheirs2\n>>>>>>> branch\nend\n")
+	doc, err := markers.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	return doc
+}
+
+func newModelForDoc(t *testing.T, doc markers.Document) model {
+	t.Helper()
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	return model{
+		state:           state,
+		doc:             doc,
+		currentConflict: 0,
+		selectedSide:    selectedOurs,
+		manualResolved:  map[int][]byte{},
+		viewportOurs:    viewport.New(10, 5),
+		viewportResult:  viewport.New(10, 5),
+		viewportTheirs:  viewport.New(10, 5),
+	}
+}
+
+func TestFirstUnresolvedConflict(t *testing.T) {
+	t.Run("skips resolved conflict", func(t *testing.T) {
+		doc := parseMultiConflictDoc(t)
+		setConflictResolution(t, &doc, 0, markers.ResolutionOurs)
+
+		if got := firstUnresolvedConflict(doc, nil); got != 1 {
+			t.Fatalf("firstUnresolvedConflict = %d, want 1", got)
+		}
+	})
+
+	t.Run("skips manual resolved conflict", func(t *testing.T) {
+		doc := parseMultiConflictDoc(t)
+		manualResolved := map[int][]byte{0: []byte("manual\n")}
+
+		if got := firstUnresolvedConflict(doc, manualResolved); got != 1 {
+			t.Fatalf("firstUnresolvedConflict = %d, want 1", got)
+		}
+	})
+
+	t.Run("keeps first conflict when all are resolved", func(t *testing.T) {
+		doc := parseMultiConflictDoc(t)
+		setConflictResolution(t, &doc, 0, markers.ResolutionOurs)
+		setConflictResolution(t, &doc, 1, markers.ResolutionTheirs)
+
+		if got := firstUnresolvedConflict(doc, nil); got != 0 {
+			t.Fatalf("firstUnresolvedConflict = %d, want 0", got)
+		}
+	})
+}
+
+func setConflictResolution(t *testing.T, doc *markers.Document, index int, resolution markers.Resolution) {
+	t.Helper()
+	ref := doc.Conflicts[index]
+	seg, ok := doc.Segments[ref.SegmentIndex].(markers.ConflictSegment)
+	if !ok {
+		t.Fatalf("segment %d = %T, want ConflictSegment", ref.SegmentIndex, doc.Segments[ref.SegmentIndex])
+	}
+	seg.Resolution = resolution
+	doc.Segments[ref.SegmentIndex] = seg
+}
+
+func conflictResolution(t *testing.T, doc markers.Document, index int) markers.Resolution {
+	t.Helper()
+	ref := doc.Conflicts[index]
+	seg, ok := doc.Segments[ref.SegmentIndex].(markers.ConflictSegment)
+	if !ok {
+		t.Fatalf("expected conflict segment")
+	}
+	return seg.Resolution
+}
+
+func TestEnsureVisibleOffsets(t *testing.T) {
+	viewportModel := viewport.New(10, 4)
+	viewportModel.YOffset = 3
+	ensureVisible(&viewportModel, 0, 10)
+	if viewportModel.YOffset != 0 {
+		t.Fatalf("YOffset = %d, want 0", viewportModel.YOffset)
+	}
+
+	ensureVisible(&viewportModel, 9, 10)
+	if viewportModel.YOffset != 6 {
+		t.Fatalf("YOffset = %d, want 6", viewportModel.YOffset)
+	}
+
+	viewportModel.YOffset = 5
+	ensureVisible(&viewportModel, 1, 0)
+	if viewportModel.YOffset != 0 {
+		t.Fatalf("YOffset = %d, want 0 for empty total", viewportModel.YOffset)
+	}
+
+	viewportModel.Height = 0
+	viewportModel.YOffset = 5
+	ensureVisible(&viewportModel, 2, 10)
+	if viewportModel.YOffset != 5 {
+		t.Fatalf("YOffset = %d, want unchanged when height is zero", viewportModel.YOffset)
+	}
+}
+
+func TestScrollToTopAndBottom(t *testing.T) {
+	lines := strings.Join([]string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}, "\n")
+
+	m := model{
+		viewportOurs:   viewport.New(5, 3),
+		viewportResult: viewport.New(5, 3),
+		viewportTheirs: viewport.New(5, 3),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(lines)
+		viewportModel.ScrollDown(5)
+	}
+
+	m.scrollToTop()
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		if viewportModel.YOffset != 0 {
+			t.Fatalf("YOffset = %d, want 0 after scrollToTop", viewportModel.YOffset)
+		}
+	}
+
+	m.scrollToBottom()
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		if viewportModel.YOffset != 7 {
+			t.Fatalf("YOffset = %d, want 7 after scrollToBottom", viewportModel.YOffset)
+		}
+	}
+}
+
+func TestScrollHorizontal(t *testing.T) {
+	content := "0123456789"
+
+	m := model{
+		viewportOurs:   viewport.New(5, 1),
+		viewportResult: viewport.New(5, 1),
+		viewportTheirs: viewport.New(5, 1),
+	}
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		viewportModel.SetContent(content)
+	}
+
+	m.scrollHorizontal(4)
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		if got := viewportModel.View(); got != "45678" {
+			t.Fatalf("View = %q, want 45678 after scrollHorizontal", got)
+		}
+	}
+
+	m.scrollHorizontal(-2)
+	for _, viewportModel := range []*viewport.Model{&m.viewportOurs, &m.viewportResult, &m.viewportTheirs} {
+		if got := viewportModel.View(); got != "23456" {
+			t.Fatalf("View = %q, want 23456 after scrollHorizontal left", got)
+		}
+	}
+}
+
+func TestToastAndKeySeqExpiry(t *testing.T) {
+	m := model{
+		toastMessage:   "Saved",
+		toastSeq:       2,
+		keySeq:         "g",
+		keySeqTimeout:  4,
+		viewportOurs:   viewport.New(1, 1),
+		viewportResult: viewport.New(1, 1),
+		viewportTheirs: viewport.New(1, 1),
+	}
+
+	updated, _ := m.Update(toastExpiredMsg{id: 1})
+	updatedModel := updated.(model)
+	if updatedModel.toastMessage == "" {
+		t.Fatalf("toastMessage cleared for mismatched id")
+	}
+
+	updated, _ = updatedModel.Update(toastExpiredMsg{id: 2})
+	updatedModel = updated.(model)
+	if updatedModel.toastMessage != "" {
+		t.Fatalf("toastMessage not cleared for matching id")
+	}
+
+	updatedModel.keySeq = "g"
+	updated, _ = updatedModel.Update(keySeqExpiredMsg{id: 3})
+	updatedModel = updated.(model)
+	if updatedModel.keySeq == "" {
+		t.Fatalf("keySeq cleared for mismatched id")
+	}
+
+	updated, _ = updatedModel.Update(keySeqExpiredMsg{id: 4})
+	updatedModel = updated.(model)
+	if updatedModel.keySeq != "" {
+		t.Fatalf("keySeq not cleared for matching id")
+	}
+}
+
+func TestWriteResolvedAllowsUnresolved(t *testing.T) {
+	tmpDir := t.TempDir()
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	if err := os.WriteFile(mergedPath, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	input := []byte("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n")
+	doc, err := markers.Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		state: state,
+		opts:  cli.Options{MergedPath: mergedPath},
+	}
+
+	if err := m.writeResolved(); err != nil {
+		t.Fatalf("writeResolved error = %v", err)
+	}
+
+	data, err := os.ReadFile(mergedPath)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if !bytes.Contains(data, []byte("<<<<<<<")) {
+		t.Fatalf("expected unresolved markers to be written")
+	}
+}
+
+func TestWriteResolvedPreservesMergedLabelsForUnresolved(t *testing.T) {
+	tmpDir := t.TempDir()
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	if err := os.WriteFile(mergedPath, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	input := []byte("<<<<<<< /tmp/ec-local-123\nours\n=======\ntheirs\n>>>>>>> /tmp/ec-remote-456\n")
+	doc, err := markers.Parse(input)
+	if err != nil {
+		t.Fatalf("Parse error = %v", err)
+	}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	if err := state.ImportMerged([]byte("<<<<<<< ec\nours\n=======\ntheirs\n>>>>>>> main\n")); err != nil {
+		t.Fatalf("ImportMerged error = %v", err)
+	}
+
+	m := model{
+		state: state,
+		opts:  cli.Options{MergedPath: mergedPath},
+	}
+	m.refreshResolverCaches()
+
+	if err := m.writeResolved(); err != nil {
+		t.Fatalf("writeResolved error = %v", err)
+	}
+
+	data, err := os.ReadFile(mergedPath)
+	if err != nil {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if !bytes.Contains(data, []byte("<<<<<<< ec\n")) {
+		t.Fatalf("expected preserved ours label, got:\n%s", string(data))
+	}
+	if !bytes.Contains(data, []byte(">>>>>>> main\n")) {
+		t.Fatalf("expected preserved theirs label, got:\n%s", string(data))
+	}
+	if bytes.Contains(data, []byte("/tmp/ec-local-123")) || bytes.Contains(data, []byte("/tmp/ec-remote-456")) {
+		t.Fatalf("expected temp labels to be removed, got:\n%s", string(data))
+	}
+}
+
+func TestWriteResolvedCreatesBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	mergedPath := filepath.Join(tmpDir, "merged.txt")
+	if err := os.WriteFile(mergedPath, []byte("original\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+
+	doc := markers.Document{Segments: []markers.Segment{markers.TextSegment{Bytes: []byte("resolved\n")}}}
+	state, err := engine.NewState(doc)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+
+	m := model{
+		state: state,
+		opts:  cli.Options{MergedPath: mergedPath, Backup: true},
+	}
+
+	if err := m.writeResolved(); err != nil {
+		t.Fatalf("writeResolved error = %v", err)
+	}
+
+	backupPath := mergedPath + ".ec.bak"
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("ReadFile backup error = %v", err)
+	}
+	if string(backup) != "original\n" {
+		t.Fatalf("backup content = %q, want %q", string(backup), "original\\n")
+	}
+}
