@@ -1361,7 +1361,7 @@ func TestUpdateApplyAllClearsManual(t *testing.T) {
 	}
 }
 
-func TestUpdateAcceptSelection(t *testing.T) {
+func TestUpdateSpaceNoLongerAccepts(t *testing.T) {
 	doc := parseSingleConflictDoc(t)
 	m := newModelForDoc(t, doc)
 	m.selectedSide = selectedTheirs
@@ -1369,32 +1369,26 @@ func TestUpdateAcceptSelection(t *testing.T) {
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	result := updated.(model)
-	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionTheirs {
-		t.Fatalf("resolution = %q, want theirs", got)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionUnset {
+		t.Fatalf("resolution = %q, want unset: space must no longer accept", got)
 	}
-	if len(result.manualResolved) != 0 {
-		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	if len(result.manualResolved) != 1 {
+		t.Fatalf("manualResolved len = %d, want the previous state kept", len(result.manualResolved))
 	}
 }
 
-func TestUpdateAcceptNoOpDoesNotGrowUndo(t *testing.T) {
+func TestUpdateSpaceDoesNotGrowUndo(t *testing.T) {
 	doc := parseSingleConflictDoc(t)
 	m := newModelForDoc(t, doc)
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	result := updated.(model)
-	if got := result.undoDepth(); got != 1 {
-		t.Fatalf("UndoDepth = %d, want 1", got)
-	}
-
-	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
-	result = updated.(model)
-	if got := result.undoDepth(); got != 1 {
-		t.Fatalf("UndoDepth = %d, want 1 after repeated accept", got)
+	if got := result.undoDepth(); got != 0 {
+		t.Fatalf("UndoDepth = %d, want 0: space is not a mutation", got)
 	}
 }
 
-func TestUpdateAcceptSelectionWithSpace(t *testing.T) {
+func TestUpdateSpaceNoOpDoesNotResolve(t *testing.T) {
 	doc := parseSingleConflictDoc(t)
 	m := newModelForDoc(t, doc)
 	m.selectedSide = selectedTheirs
@@ -1402,11 +1396,11 @@ func TestUpdateAcceptSelectionWithSpace(t *testing.T) {
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
 	result := updated.(model)
-	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionTheirs {
-		t.Fatalf("resolution = %q, want theirs", got)
+	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionUnset {
+		t.Fatalf("resolution = %q, want unset", got)
 	}
-	if len(result.manualResolved) != 0 {
-		t.Fatalf("manualResolved len = %d, want 0", len(result.manualResolved))
+	if len(result.manualResolved) != 1 {
+		t.Fatalf("manualResolved len = %d, want 1", len(result.manualResolved))
 	}
 }
 

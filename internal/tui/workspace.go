@@ -178,7 +178,7 @@ func (m workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cancelVisit()
 			return m, tea.Quit
 		}
-		if key == keyBack && (m.child != nil || m.opening) {
+		if key == keyBack && (m.child != nil || m.opening) && !m.childOverlayOpen() {
 			{
 				m.nextVisit()
 				m.child, m.opening = nil, false
@@ -229,6 +229,13 @@ func (m workspaceModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	return m, nil
+}
+
+// childOverlayOpen reports whether the resolver child owns esc itself. Without
+// this the workspace would close the whole resolver instead of the overlay.
+func (m workspaceModel) childOverlayOpen() bool {
+	resolver, ok := m.child.(model)
+	return ok && resolver.overlayOpen()
 }
 
 func (m workspaceModel) open(selection WorkspaceSelection) tea.Cmd {

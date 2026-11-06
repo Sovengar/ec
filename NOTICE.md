@@ -18,3 +18,10 @@ inline editor (`e`), external editor moved to `E`, AI (`A`) and abort (`X`)
 hooks and their tests.
 
 MIT License, Copyright (c) 2024-2026 chojs23. Full text in `LICENSE.ec2`.
+
+## agentbridge (sovengar/agentbridge)
+
+`internal/agent` is the only package that imports
+https://github.com/sovengar/agentbridge (MIT). It provides the harness catalog,
+per-harness argv capabilities, model/effort catalogs and the headless
+`ProcessInvoker`. Its `go 1.26.3` directive is why this module's floor moved.

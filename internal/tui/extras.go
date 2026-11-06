@@ -134,10 +134,6 @@ func padToHeight(block string, height, width int) string {
 
 // Host hooks add project-specific actions to the resolver.
 var (
-	// AgentCommand is the shell command used by the AI handoff key.
-	AgentCommand string
-	// AgentResolve returns a resolved body for one conflict.
-	AgentResolve func(path string, ours, base, theirs []byte) ([]byte, error)
 	// AbortMergeFunc cancels the in-progress merge.
 	AbortMergeFunc func() error
 )
@@ -145,13 +141,13 @@ var (
 const (
 	keyEditInline   = "e"
 	keyEditExternal = "E"
-	keyAI           = "A"
+	keyAIPicker     = "a"
 )
 
 func init() {
 	resolverKeyActions[keyEditInline] = (*model).handleEditInline
 	resolverKeyActions[keyEditExternal] = (*model).handleEdit
-	resolverKeyActions[keyAI] = (*model).handleAI
+	resolverKeyActions[keyAIPicker] = (*model).handleAI
 	resolverKeyActions[keyAbortMerge] = (*model).handleAbortMerge
 }
 
@@ -175,35 +171,6 @@ func (m *model) handleEditInline() (tea.Cmd, error) {
 	m.editing = true
 	m.editErr = ""
 	return nil, nil
-}
-
-// handleAI resolves the selected conflict with the configured agent.
-func (m *model) handleAI() (tea.Cmd, error) {
-	if AgentResolve == nil {
-		return m.showToast("no agent: use --ai CMD or EC_AGENT", 3), nil
-	}
-	if m.state == nil || m.currentConflict < 0 || m.currentConflict >= len(m.doc.Conflicts) {
-		return nil, nil
-	}
-	seg, ok := m.currentConflictSegment()
-	if !ok {
-		return nil, nil
-	}
-	text, err := AgentResolve(m.opts.MergedPath, seg.Ours, seg.Base, seg.Theirs)
-	if err != nil {
-		return m.showToast("AI: "+err.Error(), 4), nil
-	}
-	if len(text) == 0 {
-		return m.showToast("AI: empty resolution", 3), nil
-	}
-	if err := m.applyResolverMutation(func() error {
-		return m.state.ApplyText(m.currentConflict, text)
-	}); err != nil {
-		return m.showToast("AI: "+err.Error(), 4), nil
-	}
-	m.refreshResolverCaches()
-	m.updateViewports()
-	return m.showToast("AI applied", 2), nil
 }
 
 // handleAbortMerge cancels the merge and returns to the selector.

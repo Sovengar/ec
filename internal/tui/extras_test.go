@@ -68,7 +68,7 @@ func TestHelpOverlayListsFullKeybinds(t *testing.T) {
 	m := model{}
 	m.showHelp = true
 	view := ansi.Strip(m.renderHelpOverlay(120, 40))
-	for _, want := range []string{"Navigate hunks", "Select preview in result", "space", "tab", "Show", "cancel merge"} {
+	for _, want := range []string{"Navigate hunks", "Select preview in result", "ask AI", "tab", "Show", "cancel merge"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("overlay missing %q:\n%s", want, view)
 		}

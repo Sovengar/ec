@@ -9,14 +9,14 @@ and an AI handoff. The interactive view is a port of
 [chojs23/ec](https://github.com/chojs23/ec) ("ec2"): file selector, then
 `OURS | RESULT | THEIRS`, diff3 conflict style, undo/redo, syntax highlighting.
 
-Local additions on top of ec2: AI handoff (`A`, `--ai`, `--emit`,
-`--apply-json`), merge abort (`x`, `--abort`), file listing (`--list`),
-in-TUI editor (`e`), external editor moved to `E`, and diff3 restoration when
-the merged file was written in the simple two-way style.
+Local additions on top of ec2: AI handoff (`a` picker via agentbridge,
+`--emit`, `--apply-json`), merge abort (`x`, `--abort`), file listing
+(`--list`), in-TUI editor (`e`), external editor moved to `E`, and diff3
+restoration when the merged file was written in the simple two-way style.
 
 ## Stack
 
-- Go 1.24+, module `github.com/sovengar/ec`
+- Go 1.26.3+, module `github.com/sovengar/ec` (agentbridge declares that floor)
 - `charmbracelet/bubbletea`, `bubbles`, `lipgloss`, `chroma/v2`
 - `internal/` packages vendored from ec2 (see `NOTICE.md`); edit them in place
 - No cgo: git via subprocess (`git diff --name-only --diff-filter=U`,
@@ -43,13 +43,17 @@ The Go toolchain is mise's. If a bare `go` misbehaves, use
 
 `↑`/`↓` and `j/k` navigate hunks; `ctrl+↑/↓` and `ctrl+j/k` scroll the file
 line by line; `ctrl+←/→` scroll horizontally; `ctrl+h`/`ctrl+l` and the plain
-arrow keys select the preview in RESULT; `tab` toggles ours/theirs; `space`
-accepts; `o/t` apply side, `O/T` all, `b` both, `d` discard,
-`u`/`ctrl+r` undo/redo, `gg/G/zz` top/bottom/recenter, `e` in-TUI editor
-(syntax colored, conflict regions painted by side, `tab` switches the clean
-reference side, `ctrl+g` toggles it), `E` external editor, `A` AI, `x` cancel
-merge, `w`/`ctrl+s` write, `esc` back to selector, `q` quit, `?` keybind
-overlay grouped by section with `/` filtering. The bottom rounded `Keybinds`
+arrow keys select the preview in RESULT; `tab` toggles ours/theirs; `o/t` apply
+side, `O/T` all, `b` both, `d` discard, `u`/`ctrl+r` undo/redo, `gg/G/zz`
+top/bottom/recenter, `e` in-TUI editor (syntax colored, conflict regions painted
+by side, `tab` switches the clean reference side, `ctrl+g` toggles it), `E`
+external editor, `a` Ask AI, `x` cancel merge, `w`/`ctrl+s` write, `esc` back to
+selector, `q` quit, `?` keybind overlay grouped by section with `/` filtering.
+
+`space` is deliberately unbound: accept was removed by user decision, and side
+application stays on `o`/`t`/`O`/`T`. `A` is a no-op for the same reason; the
+only AI entry point is lowercase `a`. There is no accept entry in
+`resolverKeyHelp`. The bottom rounded `Keybinds`
 box wraps the list at 7 hints per row and skips `overlayOnly` entries; `?`
 shows the same list as a centered overlay. Both come from `resolverKeyHelp`.
 Duplicate entries are a bug.
@@ -64,8 +68,10 @@ each pane title lives in its own border, and the RESULT one carries
 | Path | Role |
 |---|---|
 | `main.go` | CLI flags, non-interactive modes, TUI wiring and host hooks |
-| `conflict.go`, `resolve.go`, `ai.go`, `abort.go`, `list.go` | extras: parse, strategies, AI protocol, merge abort, listing |
-| `internal/tui` | file selector, three panes, key actions; `extras.go` holds hooks, editors, AI and abort |
+| `conflict.go`, `resolve.go`, `ai.go`, `abort.go`, `list.go` | extras: parse, strategies, CLI AI surfaces, merge abort, listing |
+| `internal/handoff` | stdlib-only versioned wire protocol, prompt and tolerant reply extraction |
+| `internal/agent` | the only agentbridge import: detect, options, capabilities, last choice, headless resolve |
+| `internal/tui` | file selector, three panes, key actions; `extras.go` holds hooks/editors/abort, `askai.go` the Ask AI picker and async run |
 | `internal/engine` | conflict state: apply resolutions, `ApplyText`, render, import merged |
 | `internal/markers` | strict conflict parser/renderer (diff3 aware) |
 | `internal/mergeview` | canonical document from base/local/remote stages |
@@ -97,8 +103,17 @@ each pane title lives in its own border, and the RESULT one carries
 6. **`d` discards, `x` cancels the merge**: they are not duplicates. `d`
    applies `ResolutionNone`; `x` aborts the merge. The old `X` alias is gone.
 7. **Watermark**: the AI reply text must contain no conflict markers; the
-   engine rejects nothing by itself, so check in `aiResolveOne`.
-8. **`run` name clash**: package `internal/run` is imported as `ecrun` in
+   engine rejects nothing by itself, so `internal/handoff.HasMarker` guards both
+   `ApplyResponse` and `agent.Bridge.Resolve`. Agentbridge must never be
+   imported outside `internal/agent`.
+8. **Ask AI is asynchronous**: the picker only collects harness/model/effort;
+   `startAskAI` returns a `tea.Cmd` and the reply arrives as `aiResolvedMsg`. It
+   is applied only when its visit, sequence, conflict index and the merged-file
+   fingerprint all still match. The AI path never writes the file — only `w`,
+   the editor, and `--apply-json` do.
+9. **Overlay ownership**: while `askAIOpen` the resolver consumes keys first, and
+   `workspaceModel.childOverlayOpen` keeps `esc` from closing the whole resolver.
+10. **`run` name clash**: package `internal/run` is imported as `ecrun` in
    `main.go` because `run` is the CLI entry function.
 
 ## Conventions

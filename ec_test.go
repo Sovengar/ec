@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -165,14 +166,69 @@ func writeConflicted(t *testing.T, body string) string {
 	return p
 }
 
-func TestEndToEndAI(t *testing.T) {
-	path := writeConflicted(t, conflicted)
-	agent := filepath.Join(t.TempDir(), "agent.sh")
-	script := "#!/bin/sh\ncat >/dev/null\nprintf '{\"version\":\"1\",\"resolutions\":[{\"path\":\"" + path + "\",\"id\":1,\"text\":\"MERGED\\\\n\"}]}'\n"
-	if err := os.WriteFile(agent, []byte(script), 0o755); err != nil {
+// captureStdout runs fn with stdout redirected and returns what it printed.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
 		t.Fatal(err)
 	}
-	code := run([]string{"--ai", agent, "--backup", path})
+	previous := os.Stdout
+	os.Stdout = writer
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := reader.Read(buf)
+			b.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		done <- b.String()
+	}()
+	fn()
+	_ = writer.Close()
+	os.Stdout = previous
+	return <-done
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := os.Stderr
+	os.Stderr = writer
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		buf := make([]byte, 4096)
+		for {
+			n, err := reader.Read(buf)
+			b.Write(buf[:n])
+			if err != nil {
+				break
+			}
+		}
+		done <- b.String()
+	}()
+	fn()
+	_ = writer.Close()
+	os.Stderr = previous
+	return <-done
+}
+
+func TestEndToEndApplyJSON(t *testing.T) {
+	path := writeConflicted(t, conflicted)
+	reply := filepath.Join(t.TempDir(), "reply.json")
+	body := fmt.Sprintf(`{"version":"1","resolutions":[{"path":%q,"id":1,"text":%q}]}`, path, "MERGED\n")
+	if err := os.WriteFile(reply, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := run([]string{"--apply-json", reply, "--backup", path})
 	if code != 0 {
 		t.Fatalf("want exit 0, got %d", code)
 	}
@@ -187,7 +243,47 @@ func TestEndToEndAI(t *testing.T) {
 		t.Fatalf("want backup: %v", err)
 	}
 	if code := run([]string{"--check", path}); code != 0 {
-		t.Fatalf("check after AI must pass, got %d", code)
+		t.Fatalf("check after apply must pass, got %d", code)
+	}
+}
+
+func TestEmitCLIPrintsVersionedHandoff(t *testing.T) {
+	path := writeConflicted(t, conflicted)
+	var code int
+	out := captureStdout(t, func() {
+		code = run([]string{"--emit", path})
+	})
+	if code != 0 {
+		t.Fatalf("want exit 0, got %d", code)
+	}
+	req, err := decodeRequest([]byte(out))
+	if err != nil {
+		t.Fatalf("emit output is not the handoff JSON: %v\n%s", err, out)
+	}
+	if req.Version != ProtocolVersion {
+		t.Fatalf("version = %q", req.Version)
+	}
+	if len(req.Files) != 1 || req.Files[0].Conflicts[0].Ours != "OURS\n" {
+		t.Fatalf("bad payload: %s", out)
+	}
+}
+
+func TestAIRemovedIsAUsageError(t *testing.T) {
+	path := writeConflicted(t, conflicted)
+	var code int
+	errOut := captureStderr(t, func() {
+		code = run([]string{"--ai", "some-agent", path})
+	})
+	if code != 2 {
+		t.Fatalf("want usage exit 2, got %d", code)
+	}
+	for _, want := range []string{"--ai was removed", `"a"`, "--emit", "--apply-json"} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("error must name %q:\n%s", want, errOut)
+		}
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != conflicted {
+		t.Fatal("--ai must not touch the file")
 	}
 }
 

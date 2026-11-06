@@ -67,7 +67,8 @@ func TestConflictSyntaxRenderingPreservesDecisionUndoRedoAndSaveBytes(t *testing
 			assertConflictSyntaxView(t, m, "const shared: string")
 			assertConflictMergeBytes(t, m, conflicted)
 
-			m = updateConflictSyntaxModel(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{' '}})
+			// Space is no longer the accept binding; t applies theirs.
+			m = updateConflictSyntaxModel(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
 			assertConflictSyntaxView(t, m, "const shared: string")
 			assertConflictMergeBytes(t, m, wantTheirs)
 

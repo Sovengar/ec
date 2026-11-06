@@ -16,7 +16,6 @@ ec --check FILE...          # 0 = clean, 1 = conflicts remain
 ec --apply-all ours|theirs|both|none FILE...
 ec --emit FILE...           # AI handoff request as JSON
 ec --apply-json reply.json FILE...
-ec --ai 'agent-cmd' FILE... # pipe JSON to agent, apply its reply
 ec --abort                  # cancel the merge, restore pre-merge state
 ```
 
@@ -47,7 +46,6 @@ which opens centered over the panes.
 | `ctrl+←`/`ctrl+→` | scroll horizontally |
 | `ctrl+h`/`ctrl+l`, `←`/`→` | Select preview in result (in `?` only) |
 | `tab` | switch ours/theirs |
-| `space` | Select (accept previewed side) |
 | `?` | Keybinds overlay: grouped by section, `/` filters |
 | `o` / `t` | apply ours / theirs (in `?` only) |
 | `O` / `T` | apply ours / theirs to all conflicts |
@@ -58,7 +56,7 @@ which opens centered over the panes.
 | `g g` / `G` / `z z` | top / bottom / recenter |
 | `e` | edit the file in the TUI (syntax colored) |
 | `E` | edit the file in `$EDITOR` |
-| `A` | resolve selected conflict with the AI agent |
+| `a` | Ask AI: pick harness, model and effort for the selected conflict |
 | `x` | cancel the merge |
 | `w` / `ctrl+s` | write the result |
 | `esc` | back to file selector |
@@ -78,9 +76,30 @@ Both keep the **diff3** conflict style: `<<<<<<<`, `||||||| base`, `=======`,
 section from the merge stages, so the RESULT pane and both editors always show
 the triple diff, never a simple ours-vs-theirs diff.
 
+## Ask AI
+
+`a` opens a picker over the panes, fed by
+[agentbridge](https://github.com/sovengar/agentbridge): the harnesses installed
+on this machine, each with the model and effort it actually supports. `tab`
+moves between harness, model and effort, `j`/`k` changes the value, typing sets a
+model by hand when the harness exposes no local catalog, `enter` advances and
+runs on the last field, `esc` closes. A harness with no headless mode is shown
+as unavailable and never started.
+
+The selected harness runs headless with the handoff JSON in its prompt and the
+reply is applied to the selected conflict **in memory**. Nothing is written
+until you press `w`; the run is asynchronous, so the resolver keeps repainting
+and accepting navigation, and a reply that arrives after you moved on (or after
+the merged file changed on disk) is dropped instead of applied.
+
+Defaults, highest precedence first: `EC_HARNESS`/`EC_MODEL`/`EC_EFFORT`, then
+the last choice (kept under the user cache directory), then the first detected
+harness with an empty model and effort. A remembered harness that is no longer
+installed falls back instead of failing.
+
 ## AI handoff protocol
 
-ec sends this on the agent's stdin:
+`--emit` prints this, and Ask AI puts the same payload in the harness prompt:
 
 ```json
 {"version":"1","files":[{"path":"f.txt","conflicts":[
@@ -104,7 +123,9 @@ Guarantees before any write:
 - after apply, `--check` runs again
 - exit codes: `0` clean, `1` conflicts remain, `2` usage or IO error
 
-Set the agent for the `A` key with `--ai CMD` or `EC_AGENT=CMD`.
+`--ai` and `EC_AGENT` were removed: their value was a shell command, which cannot
+be mapped onto a harness name. Use the `a` picker interactively, or
+`--emit`/`--apply-json` for scripted handoffs.
 
 ## Build and development
 

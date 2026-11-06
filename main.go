@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/sovengar/ec/internal/agent"
 	"github.com/sovengar/ec/internal/cli"
 	ecrun "github.com/sovengar/ec/internal/run"
 	"github.com/sovengar/ec/internal/tui"
@@ -22,7 +23,6 @@ Usage:
   ec --apply-all STRATEGY PATH... resolve every block (ours|theirs|both|none)
   ec --emit PATH...           print the AI handoff request (JSON)
   ec --apply-json FILE PATH... apply an agent reply from a file
-  ec --ai CMD PATH...         pipe JSON to CMD, apply its reply
   ec --abort                  cancel the merge and restore pre-merge state
   ec --tui                    open the interactive panel (buttons)
 
@@ -38,9 +38,11 @@ Options:
   --help          print this text
 
 AI handoff:
+  press "a" in the resolver to pick an installed harness, model and effort
   ec emits {"version":"1","files":[{path,conflicts:[{id,start,end,ours,base,theirs,before,after}]}]}
   agent replies {"version":"1","resolutions":[{path,id,text,confidence,note}]}
   ec verifies every conflict id, rejects markers, writes atomically, then re-checks.
+  --emit and --apply-json are the scriptable form; --ai was removed.
 
 Exit codes: 0 clean, 1 conflicts remain, 2 usage or IO error.
 `
@@ -212,11 +214,7 @@ func run(args []string) int {
 		}
 		return runApplyJSON(o.applyJSON, paths, o)
 	case o.ai != "":
-		paths, err := o.targetPaths()
-		if err != nil {
-			return usageErr(err)
-		}
-		return runAI(o.ai, paths, o)
+		return usageErr(errAIRemoved)
 	case len(o.paths) == 0 && isTerminal(os.Stdin):
 		return runEc2TUI(o)
 	case len(o.paths) == 4:
@@ -277,14 +275,10 @@ func runAbort(o *options) int {
 // runEc2TUI opens the three-pane resolver. With no paths it uses the
 // repository's conflicted files; four paths select the mergetool form.
 func runEc2TUI(o *options) int {
-	agent := o.ai
-	if agent == "" {
-		agent = os.Getenv("EC_AGENT")
+	if os.Getenv("EC_AGENT") != "" {
+		fmt.Fprintln(os.Stderr, "ec: EC_AGENT is ignored; set EC_HARNESS/EC_MODEL/EC_EFFORT or press \"a\" in the resolver")
 	}
-	tui.AgentCommand = agent
-	tui.AgentResolve = func(path string, ours, base, theirs []byte) ([]byte, error) {
-		return aiResolveOne(agent, path, ours, base, theirs)
-	}
+	tui.AgentBridge = agent.New()
 	tui.AbortMergeFunc = func() error { return AbortMerge("", false) }
 
 	opts := cli.Options{Backup: o.backup}
@@ -368,25 +362,6 @@ func runApplyJSON(file string, paths []string, o *options) int {
 		return 2
 	}
 	resp, err := ParseResponse(data)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ec:", err)
-		return 2
-	}
-	return applyAndReport(paths, resp, o)
-}
-
-func runAI(command string, paths []string, o *options) int {
-	files, err := LoadAll(paths)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "ec:", err)
-		return 2
-	}
-	if len(files) == 0 {
-		fmt.Println("ec: no conflicts found")
-		return 0
-	}
-	req := BuildRequest(files, 3)
-	resp, err := RunAgent(command, req)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ec:", err)
 		return 2

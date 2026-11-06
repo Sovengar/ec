@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/sovengar/ec/internal/handoff"
 )
 
 // Strategy is a non-interactive resolution choice.
@@ -113,16 +115,8 @@ func (f *ConflictFile) ReplaceBlocks(texts map[int]string) (string, error) {
 	return strings.Join(lines, ""), nil
 }
 
-func hasMarker(text string) bool {
-	for _, l := range splitLines(text) {
-		for _, m := range []string{markerOurs, markerBase, markerSep, markerTheirs} {
-			if isMarker(l, m) {
-				return true
-			}
-		}
-	}
-	return false
-}
+// hasMarker reports whether a resolution would reintroduce a conflict.
+func hasMarker(text string) bool { return handoff.HasMarker(text) }
 
 // Load reads and parses one file.
 func Load(path string) (*ConflictFile, error) {

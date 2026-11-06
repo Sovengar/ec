@@ -56,7 +56,6 @@ const (
 	keyApplyTheirs        = "t"
 	keyApplyOursAll       = "O"
 	keyApplyTheirsAll     = "T"
-	keyAcceptSpace        = " "
 	keyDiscard            = "d"
 	keyToggleSide         = "tab"
 	keyHelp               = "?"
@@ -83,7 +82,6 @@ var resolverKeyHelp = []keyHelpEntry{
 	{section: "Navigation", key: "ctrl+\u2190\u2192", description: "Scroll horizontally"},
 	{section: "Navigation", key: "gg/G/zz", description: "top/bottom/recenter"},
 	{section: "Preview", key: "ctrl+hl, \u2190\u2192", description: "Select preview in result", overlayOnly: true},
-	{section: "Resolve", key: "space", description: "Select"},
 	{section: "Resolve", key: "tab", description: "switch ours/theirs"},
 	{section: "Resolve", key: "o/t", description: "apply ours/theirs", overlayOnly: true},
 	{section: "Resolve", key: "O/T", description: "apply ours/theirs to all"},
@@ -92,7 +90,7 @@ var resolverKeyHelp = []keyHelpEntry{
 	{section: "Resolve", key: "u/ctrl+r", description: "undo/redo"},
 	{section: "Editing", key: "e", description: "edit in TUI"},
 	{section: "Editing", key: "E", description: "external editor"},
-	{section: "Merge", key: "A", description: "AI"},
+	{section: "Merge", key: "a", description: "ask AI"},
 	{section: "Merge", key: "x", description: "cancel merge"},
 	{section: "Merge", key: "w/ctrl+s", description: "write"},
 	{section: "General", key: "esc", description: "back to selector"},
@@ -129,7 +127,6 @@ var resolverKeyActions = map[string]keyAction{
 	keyApplyTheirs:        (*model).handleApplyTheirs,
 	keyApplyOursAll:       (*model).handleApplyOursAll,
 	keyApplyTheirsAll:     (*model).handleApplyTheirsAll,
-	keyAcceptSpace:        (*model).handleAccept,
 	keyApplyBoth:          (*model).handleApplyBoth,
 	keyUndo:               (*model).handleUndo,
 	keyRedo:               (*model).handleRedo,
@@ -234,6 +231,24 @@ type model struct {
 	editErr          string
 	showHelp         bool
 	err              error
+
+	// Ask AI picker. The run itself is asynchronous; these fields are only the
+	// form state plus the identity of the run in flight.
+	askAIOpen      bool
+	askAIFocus     int
+	askAIList      []string
+	askAIIndex     int
+	askAIModels    []string
+	askAIModelIdx  int
+	askAIModel     string
+	askAIEfforts   []string
+	askAIEffortIdx int
+	askAIEffort    string
+	askAIErr       string
+	askAINote      string
+	askAIBusy      bool
+	askAISeq       uint64
+	aiStatus       string
 }
 
 type selectionSide int
@@ -601,7 +616,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case aiResolvedMsg:
+		return m.resolveAIResult(msg)
+
 	case tea.KeyMsg:
+		if m.askAIOpen {
+			return m.updateAskAI(msg)
+		}
 		if m.showHelp {
 			return m.updateHelp(msg)
 		}
@@ -703,6 +724,9 @@ func (m model) View() string {
 	if m.editing {
 		return m.renderEditorView()
 	}
+	if m.askAIOpen {
+		return m.renderAskAIOverlay(m.width, m.height)
+	}
 	base := m.renderResolverView()
 	if m.showHelp {
 		return overlayCenter(base, m.renderHelpOverlay(m.width, m.height), m.width, m.height)
@@ -770,7 +794,7 @@ func (m model) renderResolverView() string {
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, oursPane, resultPane, theirsPane)
 
-	footer := lipgloss.JoinVertical(lipgloss.Left, m.resolverFooterText(), m.renderToastLine())
+	footer := lipgloss.JoinVertical(lipgloss.Left, m.resolverFooterText(), m.renderAIStatusLine(), m.renderToastLine())
 	panes = padToHeight(panes, m.height-lipgloss.Height(footer), m.width)
 	return lipgloss.JoinVertical(lipgloss.Left, panes, footer)
 }
@@ -996,13 +1020,6 @@ func (m *model) handleApplyOursAll() (tea.Cmd, error) {
 func (m *model) handleApplyTheirsAll() (tea.Cmd, error) {
 	if err := m.applyAll(markers.ResolutionTheirs); err != nil {
 		return nil, fmt.Errorf("failed to apply theirs to all: %w", err)
-	}
-	return nil, nil
-}
-
-func (m *model) handleAccept() (tea.Cmd, error) {
-	if err := m.applySelectedSide(); err != nil {
-		return nil, fmt.Errorf("failed to apply selection: %w", err)
 	}
 	return nil, nil
 }

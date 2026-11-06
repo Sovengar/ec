@@ -1,61 +1,31 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
+
+	"github.com/sovengar/ec/internal/handoff"
 )
 
 // ProtocolVersion is the wire version of the AI handoff.
-const ProtocolVersion = "1"
+const ProtocolVersion = handoff.ProtocolVersion
 
 // Request is what ec hands to an agent.
-type Request struct {
-	Version string `json:"version"`
-	Files   []File `json:"files"`
-}
+type Request = handoff.Request
 
 // File carries one conflicted file.
-type File struct {
-	Path      string            `json:"path"`
-	Conflicts []HandoffConflict `json:"conflicts"`
-}
+type File = handoff.File
 
 // HandoffConflict is a conflict plus local context.
-type HandoffConflict struct {
-	Conflict
-	Before []string `json:"before,omitempty"`
-	After  []string `json:"after,omitempty"`
-}
-
-// Conflict marshals with context for the agent.
-func (h HandoffConflict) MarshalJSON() ([]byte, error) {
-	type alias Conflict
-	return json.Marshal(struct {
-		alias
-		Before []string `json:"before,omitempty"`
-		After  []string `json:"after,omitempty"`
-	}{alias(h.Conflict), h.Before, h.After})
-}
+type HandoffConflict = handoff.HandoffConflict
 
 // Response is what the agent returns.
-type Response struct {
-	Version     string       `json:"version"`
-	Resolutions []Resolution `json:"resolutions"`
-}
+type Response = handoff.Response
 
 // Resolution is one resolved conflict block.
-type Resolution struct {
-	Path       string  `json:"path"`
-	ID         int     `json:"id"`
-	Text       string  `json:"text"`
-	Confidence float64 `json:"confidence,omitempty"`
-	Note       string  `json:"note,omitempty"`
-}
+type Resolution = handoff.Resolution
 
 // BuildRequest turns parsed files into the handoff payload.
 func BuildRequest(files []*ConflictFile, context int) Request {
@@ -68,9 +38,17 @@ func BuildRequest(files []*ConflictFile, context int) Request {
 		for _, c := range f.Conflicts {
 			before, after := f.Context(c, context)
 			out.Conflicts = append(out.Conflicts, HandoffConflict{
-				Conflict: c,
-				Before:   before,
-				After:    after,
+				Conflict: handoff.Conflict{
+					ID:      c.ID,
+					Start:   c.Start,
+					End:     c.End,
+					Ours:    c.Ours,
+					Base:    c.Base,
+					Theirs:  c.Theirs,
+					HasBase: c.HasBase,
+				},
+				Before: before,
+				After:  after,
 			})
 		}
 		req.Files = append(req.Files, out)
@@ -80,23 +58,12 @@ func BuildRequest(files []*ConflictFile, context int) Request {
 
 // EncodeRequest renders the handoff payload as indented JSON.
 func EncodeRequest(req Request) ([]byte, error) {
-	return json.MarshalIndent(req, "", "  ")
+	return handoff.EncodeRequest(req)
 }
 
 // ParseResponse decodes and validates an agent reply.
 func ParseResponse(data []byte) (Response, error) {
-	var resp Response
-	dec := json.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&resp); err != nil {
-		return resp, fmt.Errorf("decode agent response: %w", err)
-	}
-	if resp.Version != "" && resp.Version != ProtocolVersion {
-		return resp, fmt.Errorf("unsupported protocol version %q", resp.Version)
-	}
-	if len(resp.Resolutions) == 0 {
-		return resp, errors.New("agent returned no resolutions")
-	}
-	return resp, nil
+	return handoff.ParseResponse(data)
 }
 
 // ApplyResponse writes resolutions back into files and reports leftovers.
@@ -154,23 +121,6 @@ func ApplyResponse(files []*ConflictFile, resp Response, backup, dryRun bool) (r
 	return resolved, failed, nil
 }
 
-// RunAgent runs the agent command, feeding JSON on stdin.
-func RunAgent(command string, req Request) (Response, error) {
-	payload, err := EncodeRequest(req)
-	if err != nil {
-		return Response{}, err
-	}
-	cmd := exec.Command("sh", "-c", command)
-	cmd.Stdin = bytes.NewReader(payload)
-	var out, errBuf bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		return Response{}, fmt.Errorf("agent %q: %w: %s", command, err, errBuf.String())
-	}
-	return ParseResponse(out.Bytes())
-}
-
 // LoadAll parses every path that contains conflict markers.
 func LoadAll(paths []string) ([]*ConflictFile, error) {
 	var files []*ConflictFile
@@ -205,41 +155,10 @@ func Emit(paths []string) error {
 
 // decodeRequest reads a handoff payload back, used by tests and tooling.
 func decodeRequest(data []byte) (Request, error) {
-	var req Request
-	if err := json.Unmarshal(data, &req); err != nil {
-		return req, fmt.Errorf("decode request: %w", err)
-	}
-	return req, nil
+	return handoff.DecodeRequest(data)
 }
 
-// aiResolveOne asks the agent to resolve one conflict from the TUI.
-func aiResolveOne(command, path string, ours, base, theirs []byte) ([]byte, error) {
-	if command == "" {
-		return nil, errors.New("no agent: use --ai CMD or EC_AGENT")
-	}
-	req := Request{Version: ProtocolVersion, Files: []File{{
-		Path: path,
-		Conflicts: []HandoffConflict{{
-			Conflict: Conflict{
-				ID:      1,
-				Ours:    string(ours),
-				Base:    string(base),
-				Theirs:  string(theirs),
-				HasBase: len(base) > 0,
-			},
-		}},
-	}}}
-	resp, err := RunAgent(command, req)
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range resp.Resolutions {
-		if r.ID == 1 {
-			if hasMarker(r.Text) {
-				return nil, errors.New("agent resolution contains conflict markers")
-			}
-			return []byte(r.Text), nil
-		}
-	}
-	return nil, errors.New("agent gave no resolution for this conflict")
-}
+// errAIRemoved explains the removal of --ai. Its old value was a shell command,
+// so aliasing it to a harness name would silently change what it does.
+var errAIRemoved = errors.New(`--ai was removed: the AI handoff now runs through the resolver's "a" overlay; ` +
+	`for scripted handoffs use --emit and --apply-json`)

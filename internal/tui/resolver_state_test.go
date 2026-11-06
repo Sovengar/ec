@@ -36,7 +36,7 @@ func TestResolverHunkLabelsSeparateSelectionFromResolution(t *testing.T) {
 				key, status string
 			}{
 				{status: "UNRESOLVED"}, {key: "l", status: "UNRESOLVED"},
-				{key: " ", status: "RESOLVED: THEIRS"}, {key: "h", status: "RESOLVED: THEIRS"},
+				{key: "t", status: "RESOLVED: THEIRS"}, {key: "h", status: "RESOLVED: THEIRS"},
 				{key: "u", status: "UNRESOLVED"},
 			} {
 				if step.key != "" {
