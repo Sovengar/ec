@@ -146,7 +146,6 @@ const (
 	keyEditInline   = "e"
 	keyEditExternal = "E"
 	keyAI           = "A"
-	keyAbortMerge   = "X"
 )
 
 func init() {

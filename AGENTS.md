@@ -10,7 +10,7 @@ and an AI handoff. The interactive view is a port of
 `OURS | RESULT | THEIRS`, diff3 conflict style, undo/redo, syntax highlighting.
 
 Local additions on top of ec2: AI handoff (`A`, `--ai`, `--emit`,
-`--apply-json`), merge abort (`X`, `--abort`), file listing (`--list`),
+`--apply-json`), merge abort (`x`, `--abort`), file listing (`--list`),
 in-TUI editor (`e`), external editor moved to `E`, and diff3 restoration when
 the merged file was written in the simple two-way style.
 
@@ -44,10 +44,10 @@ The Go toolchain is mise's. If a bare `go` misbehaves, use
 `↑`/`↓` and `j/k` navigate hunks; `ctrl+↑/↓` and `ctrl+j/k` scroll the file
 line by line; `ctrl+←/→` scroll horizontally; `ctrl+h`/`ctrl+l` and the plain
 arrow keys select the preview in RESULT; `tab` toggles ours/theirs; `space`
-accepts; `o/t` apply side, `O/T` all, `b/x` both/none, `d` discard,
+accepts; `o/t` apply side, `O/T` all, `b` both, `d` discard,
 `u`/`ctrl+r` undo/redo, `gg/G/zz` top/bottom/recenter, `e` in-TUI editor
 (syntax colored, conflict regions painted by side, `tab` switches the clean
-reference side, `ctrl+g` toggles it), `E` external editor, `A` AI, `X` abort
+reference side, `ctrl+g` toggles it), `E` external editor, `A` AI, `x` cancel
 merge, `w`/`ctrl+s` write, `esc` back to selector, `q` quit, `?` keybind
 overlay grouped by section with `/` filtering. The bottom rounded `Keybinds`
 box wraps the list at 7 hints per row and skips `overlayOnly` entries; `?`
@@ -84,7 +84,7 @@ each pane title lives in its own border, and the RESULT one carries
    `ctrl+s` in the in-TUI editor, and the external editor path are what write
    the file. Progress is kept in a draft under the user cache dir
    (`internal/tui/draft.go`), restored on reopen, and removed by a write or by
-   `X` abort. Do not clear it on `esc`/`q`: leaving must not lose progress.
+   `x` cancel. Do not clear it on `esc`/`q`: leaving must not lose progress.
 3. **In-TUI editor**: keys go to the editor while `m.editing`; `ctrl+s` saves
    and reloads, `esc` cancels, `tab` switches the reference side, `ctrl+g`
    toggles the clean reference panel. External editor is `E` (`$EDITOR`, default
@@ -94,8 +94,8 @@ each pane title lives in its own border, and the RESULT one carries
    mode uses the given files directly.
 5. **TUI smoke tests**: use tmux `capture-pane`; `script` gives a blank
    alt-screen with bubbletea.
-6. **`x` is the only "none"**: the old `d` discard was an exact duplicate of
-   `x`, so it was removed. Do not reintroduce a second key for one resolution.
+6. **`d` discards, `x` cancels the merge**: they are not duplicates. `d`
+   applies `ResolutionNone`; `x` aborts the merge. The old `X` alias is gone.
 7. **Watermark**: the AI reply text must contain no conflict markers; the
    engine rejects nothing by itself, so check in `aiResolveOne`.
 8. **`run` name clash**: package `internal/run` is imported as `ecrun` in

@@ -1452,10 +1452,32 @@ func TestUpdateApplyBothAndNone(t *testing.T) {
 		t.Fatalf("resolution = %q, want both", got)
 	}
 
-	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	updated, _ = result.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
 	result = updated.(model)
 	if got := conflictResolution(t, result.doc, 0); got != markers.ResolutionNone {
 		t.Fatalf("resolution = %q, want none", got)
+	}
+}
+
+func TestUpdateXAbortsMerge(t *testing.T) {
+	original := AbortMergeFunc
+	defer func() { AbortMergeFunc = original }()
+	called := false
+	AbortMergeFunc = func() error {
+		called = true
+		return nil
+	}
+	m := newModelForDoc(t, parseSingleConflictDoc(t))
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	result := updated.(model)
+	if !called {
+		t.Fatal("x must cancel the merge")
+	}
+	if !result.quitting || result.err != ErrBackToSelector {
+		t.Fatalf("x must leave the resolver, quitting=%v err=%v", result.quitting, result.err)
+	}
+	if cmd == nil {
+		t.Fatal("x must return a quit command")
 	}
 }
 

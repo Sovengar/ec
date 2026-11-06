@@ -163,7 +163,7 @@ func TestConflictResultTextHasNoUnderlineOrDimming(t *testing.T) {
 				tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}},
 				tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}},
 				tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}},
-				tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}},
+				tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}},
 			} {
 				m = updateConflictSyntaxModel(t, m, msg)
 				view := renderConflictViewport(m.viewportResult, m.resultLineStyles)

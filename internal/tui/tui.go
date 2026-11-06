@@ -57,10 +57,11 @@ const (
 	keyApplyOursAll       = "O"
 	keyApplyTheirsAll     = "T"
 	keyAcceptSpace        = " "
+	keyDiscard            = "d"
 	keyToggleSide         = "tab"
 	keyHelp               = "?"
 	keyApplyBoth          = "b"
-	keyApplyNone          = "x"
+	keyAbortMerge         = "x"
 	keyUndo               = "u"
 	keyRedo               = "ctrl+r"
 	keyWrite              = "w"
@@ -86,12 +87,13 @@ var resolverKeyHelp = []keyHelpEntry{
 	{section: "Resolve", key: "tab", description: "switch ours/theirs"},
 	{section: "Resolve", key: "o/t", description: "apply ours/theirs", overlayOnly: true},
 	{section: "Resolve", key: "O/T", description: "apply ours/theirs to all"},
-	{section: "Resolve", key: "b/x", description: "both/none"},
+	{section: "Resolve", key: "b", description: "both"},
+	{section: "Resolve", key: "d", description: "discard"},
 	{section: "Resolve", key: "u/ctrl+r", description: "undo/redo"},
 	{section: "Editing", key: "e", description: "edit in TUI"},
 	{section: "Editing", key: "E", description: "external editor"},
 	{section: "Merge", key: "A", description: "AI"},
-	{section: "Merge", key: "X", description: "abort merge"},
+	{section: "Merge", key: "x", description: "cancel merge"},
 	{section: "Merge", key: "w/ctrl+s", description: "write"},
 	{section: "General", key: "esc", description: "back to selector"},
 	{section: "General", key: "q", description: "quit"},
@@ -120,6 +122,8 @@ var resolverKeyActions = map[string]keyAction{
 	keyResScrollUpArrow:   (*model).handleScrollUp,
 	keyCtrlU:              (*model).handleHalfPageUp,
 	keyCtrlD:              (*model).handleHalfPageDown,
+	keyDiscard:            (*model).handleDiscard,
+	keyAbortMerge:         (*model).handleAbortMerge,
 	keyToggleSide:         (*model).handleToggleSide,
 	keyApplyOurs:          (*model).handleApplyOurs,
 	keyApplyTheirs:        (*model).handleApplyTheirs,
@@ -127,7 +131,6 @@ var resolverKeyActions = map[string]keyAction{
 	keyApplyTheirsAll:     (*model).handleApplyTheirsAll,
 	keyAcceptSpace:        (*model).handleAccept,
 	keyApplyBoth:          (*model).handleApplyBoth,
-	keyApplyNone:          (*model).handleApplyNone,
 	keyUndo:               (*model).handleUndo,
 	keyRedo:               (*model).handleRedo,
 	keyWrite:              (*model).handleWrite,
@@ -1011,9 +1014,9 @@ func (m *model) handleApplyBoth() (tea.Cmd, error) {
 	return nil, nil
 }
 
-func (m *model) handleApplyNone() (tea.Cmd, error) {
+func (m *model) handleDiscard() (tea.Cmd, error) {
 	if err := m.applyResolution(markers.ResolutionNone); err != nil {
-		return nil, fmt.Errorf("failed to apply none: %w", err)
+		return nil, fmt.Errorf("failed to discard selection: %w", err)
 	}
 	return nil, nil
 }

@@ -33,7 +33,7 @@ until you press `w` (or save the editor).
 Accepted hunks are kept in a draft under the user cache directory. Leaving the
 TUI and reopening the same file restores the progress. The draft is removed
 when the result is written (`w`), when the external editor closes, or when the
-merge is aborted (`X`).
+merge is cancelled (`x`).
 
 The RESULT pane border carries the current conflict, the remaining count and
 the file name. The bottom is a rounded `Keybinds` box, 7 hints per row; the
@@ -51,14 +51,15 @@ which opens centered over the panes.
 | `?` | Keybinds overlay: grouped by section, `/` filters |
 | `o` / `t` | apply ours / theirs (in `?` only) |
 | `O` / `T` | apply ours / theirs to all conflicts |
-| `b` / `x` | both / none (`x` deletes the block; there is no separate discard) |
+| `b` | both |
+| `d` | discard the block (none) |
 | `u` / `ctrl+r` | undo / redo |
 | `j` / `k`, arrows | scroll |
 | `g g` / `G` / `z z` | top / bottom / recenter |
 | `e` | edit the file in the TUI (syntax colored) |
 | `E` | edit the file in `$EDITOR` |
 | `A` | resolve selected conflict with the AI agent |
-| `X` | abort the merge |
+| `x` | cancel the merge |
 | `w` / `ctrl+s` | write the result |
 | `esc` | back to file selector |
 | `q` | quit the TUI (from anywhere) |
