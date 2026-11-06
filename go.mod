@@ -1,6 +1,6 @@
 module github.com/sovengar/ec
 
-go 1.25
+go 1.26.3
 
 require (
 	github.com/alecthomas/chroma/v2 v2.27.0
@@ -10,6 +10,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.6
 	github.com/charmbracelet/x/cellbuf v0.0.15
 	github.com/muesli/termenv v0.16.0
+	github.com/sovengar/agentbridge v0.3.1
 )
 
 require (
